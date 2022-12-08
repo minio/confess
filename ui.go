@@ -75,7 +75,7 @@ var (
 
 func getHeader(ctx *cli.Context) string {
 	var s strings.Builder
-	s.WriteString("confess " + version + " ")
+	s.WriteString("confess " + getVersion() + " ")
 	flags := ctx.GlobalFlagNames()
 	for idx, flag := range flags {
 		if !ctx.IsSet(flag) {

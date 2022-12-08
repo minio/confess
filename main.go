@@ -16,11 +16,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,7 +35,6 @@ import (
 )
 
 var (
-	version                     = "1.0.0"
 	globalContext, globalCancel = context.WithCancel(context.Background())
 	globalTermWidth             = 120
 
@@ -42,13 +46,26 @@ const (
 	envPrefix = "CONFESS_"
 )
 
+var buildInfo = map[string]string{}
+
+func init() {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, skv := range bi.Settings {
+			buildInfo[skv.Key] = skv.Value
+		}
+	}
+}
+
 func main() {
+	cli.VersionPrinter = func(c *cli.Context) {
+		io.Copy(c.App.Writer, versionBanner(c))
+	}
+
 	app := cli.NewApp()
 	app.Name = os.Args[0]
 	app.Author = "MinIO, Inc."
 	app.Description = `Object store consistency checker`
-	app.UsageText = "HOSTS [FLAGS]"
-	app.Version = version
+	app.UsageText = "[FLAGS] HOSTS"
 	app.Copyright = "(c) 2022 MinIO, Inc."
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
@@ -104,7 +121,7 @@ FLAGS:
   {{end}}
 EXAMPLES:
   1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
-     $ confess --access-key minio --secret-key minio123 http://minio{1...4}:9000 
+     $ confess --access-key minio --secret-key minio123 http://minio{1...4}:9000
 `
 	app.Action = confessMain
 	app.Run(os.Args)
@@ -122,17 +139,44 @@ func checkMain(ctx *cli.Context) {
 	}
 }
 
+func startupBanner(banner io.Writer) {
+	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
+	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, Blue("Version:")+Bold(" %s (%s %s/%s)", getVersion(), runtime.Version(), runtime.GOOS, runtime.GOARCH))
+}
+
+func versionBanner(c *cli.Context) io.Reader {
+	banner := &strings.Builder{}
+	fmt.Fprintln(banner, Bold("%s version %s (commit-id=%s)", c.App.Name, getVersion(), getRevision()))
+	fmt.Fprintln(banner, Blue("Runtime:")+Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
+	return strings.NewReader(banner.String())
+}
+
+func getVersion() string {
+	return strings.ReplaceAll(buildInfo["vcs.time"], ":", "-")
+}
+
+func getRevision() string {
+	return buildInfo["vcs.revision"]
+}
+
 func confessMain(ctx *cli.Context) {
 	checkMain(ctx)
 	rand.Seed(time.Now().UnixNano())
 	nodeState := newNodeState(ctx)
 	nodeState.init(globalContext)
-	console.Println(whiteStyle.Render("confess " + version + "\nCopyright: 2022 MinIO, Inc.\nGNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>\n"))
+
+	var builder bytes.Buffer
+	startupBanner(&builder)
+	console.Println(builder.String())
 
 	// set terminal size if available.
 	if w, e := pb.GetTerminalWidth(); e == nil {
 		globalTermWidth = w
 	}
+
 	// Monitor OS exit signals and cancel the global context in such case
 	go nodeState.trapSignals(os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 	go func() {
@@ -141,5 +185,6 @@ func confessMain(ctx *cli.Context) {
 			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
 		}
 	}()
+
 	nodeState.finish(globalContext)
 }
