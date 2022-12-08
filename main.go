@@ -53,52 +53,58 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "access-key",
-			Usage:  "Specify access key",
+			Usage:  "specify access key",
 			EnvVar: envPrefix + "ACCESS_KEY",
 			Value:  "",
 		},
 		cli.StringFlag{
 			Name:   "secret-key",
-			Usage:  "Specify secret key",
+			Usage:  "specify secret key",
 			EnvVar: envPrefix + "SECRET_KEY",
 			Value:  "",
 		},
 		cli.BoolFlag{
-			Name:  "insecure",
-			Usage: "disable SSL certificate verification",
+			Name:   "insecure",
+			Usage:  "disable TLS certificate verification",
+			EnvVar: envPrefix + "INSECURE",
 		},
 		cli.StringFlag{
 			Name:   "region",
-			Usage:  "Specify a custom region",
+			Usage:  "specify a custom region",
 			EnvVar: envPrefix + "REGION",
 		},
 		cli.StringFlag{
 			Name:   "signature",
-			Usage:  "Specify a signature method. Available values are S3V2, S3V4",
-			Value:  "S3V4",
+			Usage:  "Specify a signature method. Supported values are s3v2, s3v4",
+			Value:  "s3v4",
+			EnvVar: envPrefix + "SIGNATURE",
 			Hidden: true,
 		},
 		cli.StringFlag{
-			Name:  "bucket",
-			Usage: "Bucket to use for confess tests",
+			Name:   "bucket",
+			Usage:  "Bucket to use for confess tests",
+			EnvVar: envPrefix + "BUCKET",
 		},
 		cli.StringFlag{
 			Name:  "output, o",
-			Usage: "Specify output path for confess log",
+			Usage: "specify output path for confess log",
 		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}
+
 USAGE:
   {{.Name}} - {{.UsageText}}
+
 HOSTS:
   HOSTS is a comma separated list or a range of hostnames/ip-addresses
+
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
   1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
-     $ confess --access-key minio --secret-key minio123 -o /tmp/dir http://minio{1...4}:9000 
+     $ confess --access-key minio --secret-key minio123 http://minio{1...4}:9000 
 `
 	app.Action = confessMain
 	app.Run(os.Args)
@@ -121,7 +127,7 @@ func confessMain(ctx *cli.Context) {
 	rand.Seed(time.Now().UnixNano())
 	nodeState := newNodeState(ctx)
 	nodeState.init(globalContext)
-	console.Println(whiteStyle.Render("confess " + version + "\nCopyright 2022 MinIO\nGNU AGPL V3\n"))
+	console.Println(whiteStyle.Render("confess " + version + "\nCopyright: 2022 MinIO, Inc.\nGNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>\n"))
 
 	// set terminal size if available.
 	if w, e := pb.GetTerminalWidth(); e == nil {

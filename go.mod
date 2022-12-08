@@ -10,7 +10,6 @@ require (
 	github.com/minio/cli v1.24.0
 	github.com/minio/console v0.21.2
 	github.com/minio/madmin-go v1.7.4
-	github.com/minio/mc v0.0.0-20221114191237-bec340af652f
 	github.com/minio/md5-simd v1.1.2
 	github.com/minio/minio-go/v7 v7.0.41
 	github.com/minio/pkg v1.5.4

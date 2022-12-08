@@ -203,13 +203,13 @@ func (n *nodeState) init(ctx context.Context) {
 	n.printHeader = true
 	go func() {
 		defer n.wg.Done()
-		logFile := fmt.Sprintf("%s%s", "confess_log", time.Now().Format(".01-02-2006-15-04-05"))
+		logFile := fmt.Sprintf("%s%s.txt", "confess", time.Now().Format(".01-02-2006-15-04-05"))
 		if n.cliCtx.IsSet("output") {
 			logFile = fmt.Sprintf("%s/%s", n.cliCtx.String("output"), logFile)
 		}
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
-			console.Fatalln("could not create confess_log", err)
+			console.Fatalln("unable to write 'confess' log", err)
 			return
 		}
 		f.WriteString(getHeader(n.cliCtx))
@@ -219,8 +219,7 @@ func (n *nodeState) init(ctx context.Context) {
 			select {
 			case <-globalContext.Done():
 				if _, err := f.WriteString(n.summaryMsg()); err != nil {
-					console.Errorln(fmt.Sprintf("Error writing summary to confess_log: %s", err.Error()))
-					os.Exit(1)
+					console.Fatalf("unable to write summary to 'confess' log: %s\n", err)
 				}
 				fwriter.Flush()
 				f.Close()
@@ -239,8 +238,7 @@ func (n *nodeState) init(ctx context.Context) {
 					// log node offline|online toggle status or real errors
 					if !errors.Is(res.Err, errNodeOffline) || statusChg != "" {
 						if _, err := f.WriteString(res.String() + "\n"); err != nil {
-							console.Errorln(fmt.Sprintf("Error writing to confess_log for "+res.String(), err))
-							os.Exit(1)
+							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 						}
 					}
 				}
@@ -331,12 +329,15 @@ func (n *nodeState) summaryMsg() string {
 	success := atomic.LoadInt32(&n.numTests) - atomic.LoadInt32(&n.numFailed)
 	return fmt.Sprintf("Operations succeeded=%d Operations Failed=%d Duration=%s\n", success, atomic.LoadInt32(&n.numFailed), humanize.RelTime(n.startTime, time.Now(), "", ""))
 }
+
 func (n *nodeState) statusBar() string {
 	width := 96
 	statusKey := statusStyle.Render("STATUS")
 	success := successStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.numTests)-atomic.LoadInt32(&n.numFailed)))
 	failures := failedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.numFailed)))
-	bar := statusKey + statusTextStyle.Render("  Operations succeeded=") + success + statusTextStyle.Render("Operations Failed=") + failures + statusTextStyle.Render("Duration= "+humanize.RelTime(n.startTime, time.Now(), "", ""))
+	bar := statusKey + statusTextStyle.Render("  Operations succeeded=") + success +
+		statusTextStyle.Render("Operations Failed=") + failures +
+		statusTextStyle.Render("Duration= "+humanize.RelTime(n.startTime, time.Now(), "", ""))
 	return statusBarStyle.Width(width).Render(bar)
 }
 

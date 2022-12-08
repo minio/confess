@@ -29,7 +29,6 @@ import (
 
 	"github.com/minio/cli"
 	"github.com/minio/console/pkg"
-	"github.com/minio/mc/pkg/probe"
 	md5simd "github.com/minio/md5-simd"
 	"github.com/minio/pkg/console"
 	"golang.org/x/net/http2"
@@ -92,7 +91,7 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 		// if Signature version '2' use NewV2 directly.
 		creds = credentials.NewStaticV2(ctx.String("access-key"), ctx.String("secret-key"), "")
 	default:
-		console.Fatalln(probe.NewError(errors.New("unknown signature method. S3V2 and S3V4 is available")), strings.ToUpper(ctx.String("signature")))
+		console.Fatalln(errors.New("unknown signature method. S3V2 and S3V4 is available"), strings.ToUpper(ctx.String("signature")))
 	}
 	cl, err := minio.New(hostURL.Host, &minio.Options{
 		Creds:        creds,
