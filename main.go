@@ -106,6 +106,10 @@ func main() {
 			Name:  "output, o",
 			Usage: "specify output path for confess log",
 		},
+		cli.StringFlag{
+			Name:  "duration, d",
+			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
+		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}

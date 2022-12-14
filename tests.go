@@ -76,6 +76,7 @@ func printWithErase(erased bool, msg string) bool {
 	console.Print(msg + "\r")
 	return true
 }
+
 func (n *nodeState) queueTest(ctx context.Context, op OpSequence) {
 	select {
 	case <-ctx.Done():
@@ -150,27 +151,39 @@ func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 				return
 			}
 			oi = res.data
-			n.resCh <- res
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
 			continue
 		}
 		if op.Type == http.MethodDelete {
 			op.NodeIdx = rand.Intn(len(n.nodes))
 			res := n.runTest(ctx, op.NodeIdx, op)
-			n.resCh <- res
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
 			continue
 		}
 		var wg sync.WaitGroup
 		for i := 0; i < len(n.nodes); i++ {
 			wg.Add(1)
-			go func(i int) {
+			go func(i int, op Op) {
 				defer wg.Done()
 				op.NodeIdx = i
 				op.ObjInfo.VersionID = oi.VersionID
 				op.ObjInfo.ETag = oi.ETag
 				op.ObjInfo.Size = oi.Size
 				res2 := n.runTest(ctx, op.NodeIdx, op)
-				n.resCh <- res2
-			}(i)
+				select {
+				case n.resCh <- res2:
+				case <-ctx.Done():
+					return
+				}
+			}(i, op)
 		}
 		wg.Wait()
 	}
@@ -384,8 +397,30 @@ func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
 	}
 }
 
-func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
+func (n *nodeState) cleanup() {
+	if n.numFailed > 0 {
+		return
+	}
+	bucket := n.cliCtx.String("bucket")
+	var clnt *minio.Client
+	for _, node := range n.nodes {
+		if n.hc.isOffline(node.endpointURL) {
+			continue
+		}
+		clnt = node.client
+		break
+	}
+	for _, pfx := range n.Prefixes {
+		err := clnt.RemoveObject(context.Background(), bucket, pfx, minio.RemoveObjectOptions{
+			ForceDelete: true,
+		})
+		if err != nil {
+			continue
+		}
+	}
+}
 
+func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
 	start := time.Now()
 	res = testResult{
 		Method:   "LIST",

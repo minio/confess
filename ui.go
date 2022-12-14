@@ -106,31 +106,24 @@ type tableColumn struct {
 }
 
 func getColumns() []tableColumn {
-	var baseStyle = lipgloss.NewStyle().
+	baseStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("14")).
 		Background(lipgloss.Color("0")).
-		Bold(true)
+		Bold(true).Width(15)
 
 	return []tableColumn{
 		{Title: "Node", Width: 20, Style: baseStyle},
-		{Title: "Path", Width: 40, Style: baseStyle.Copy().
-			Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("0")).
-			Bold(false).
-			Width(40)},
+		{
+			Title: "Path", Width: 40, Style: baseStyle.Copy().
+				Foreground(lipgloss.Color("231")).
+				Background(lipgloss.Color("0")).
+				Bold(false),
+		},
 		{Title: "FuncName", Width: 4, Style: baseStyle.Copy().
 			Foreground(lipgloss.Color("231")).
 			Background(lipgloss.Color("0")).
-			Bold(false).Width(12)},
-		{Title: "Error", Width: 60, Style: baseStyle.Copy().
-			Foreground(lipgloss.Color("203")).
-			Width(80)},
+			Bold(false)},
+		{Title: "Error", Width: 80, Style: baseStyle.Copy().
+			Foreground(lipgloss.Color("#3C3C3C"))},
 	}
-}
-
-func min(i, j int) int {
-	if i < j {
-		return i
-	}
-	return j
 }

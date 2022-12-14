@@ -125,7 +125,7 @@ func newNodeState(ctx *cli.Context) *nodeState {
 	}
 	var pfxes []string
 	for i := 0; i < 10; i++ {
-		pfxes = append(pfxes, fmt.Sprintf("prefix%d", i))
+		pfxes = append(pfxes, fmt.Sprintf("confess/pfx%d", i))
 	}
 	return &nodeState{
 		startTime:  time.Now(),
@@ -167,6 +167,9 @@ func (n *nodeState) addWorker(ctx context.Context) {
 
 // returns latest health check status for a node
 func (n *nodeState) hcStatus(epURL *url.URL) string {
+	if epURL == nil {
+		return ""
+	}
 	var statusChg string
 	n.nlock.Lock()
 	_, ok := n.offlineMap[epURL.Host]
@@ -223,6 +226,8 @@ func (n *nodeState) init(ctx context.Context) {
 				}
 				fwriter.Flush()
 				f.Close()
+				n.cleanup() // finish clean up
+				console.Println(n.statusBar())
 				n.doneCh <- struct{}{}
 				return
 			case res, ok := <-n.resCh:
@@ -274,6 +279,7 @@ func (n *nodeState) finish(ctx context.Context) {
 	<-globalContext.Done()
 	n.wg.Wait()
 	close(n.resCh)
+	<-n.doneCh
 }
 
 const (
@@ -299,25 +305,44 @@ func (n *nodeState) trapSignals(sig ...os.Signal) {
 	// `signal.Notify` registers the given channel to
 	// receive notifications of the specified signals.
 	signal.Notify(sigCh, sig...)
+	var s os.Signal
+exitfor:
+	for {
+		select {
+		default:
+			var duration time.Duration
+			var timer *time.Timer
+			if n.cliCtx.IsSet("duration") {
+				duration = n.cliCtx.Duration("duration")
+				timer = time.NewTimer(duration)
+				defer timer.Stop()
+				<-timer.C
+				break exitfor
+			}
+			// Wait for the signal.
+		case s = <-sigCh:
+			signal.Stop(sigCh)
+			break exitfor
+		}
+	}
 
-	// Wait for the signal.
-	s := <-sigCh
-
-	// Once signal has been received stop signal Notify handler.
-	signal.Stop(sigCh)
-	// Cancel the global context
+	// Cancel the global context - wait for cleanup and final summary to be printed to logfile and screen
 	globalCancel()
+	n.wg.Wait()
 	<-n.doneCh // wait on signal that last operation status summary written to log
+
 	var exitCode int
-	switch s.String() {
-	case "interrupt":
-		exitCode = globalCancelExitStatus
-	case "killed":
-		exitCode = globalKillExitStatus
-	case "terminated":
-		exitCode = globalTerminatExitStatus
-	default:
-		exitCode = globalErrorExitStatus
+	if s != nil {
+		switch s.String() {
+		case "interrupt":
+			exitCode = globalCancelExitStatus
+		case "killed":
+			exitCode = globalKillExitStatus
+		case "terminated":
+			exitCode = globalTerminatExitStatus
+		default:
+			exitCode = globalErrorExitStatus
+		}
 	}
 	os.Exit(exitCode)
 }
@@ -354,10 +379,15 @@ func (n *nodeState) maxNodeLen() int {
 func (n *nodeState) printRow(r testResult) string {
 	maxNodeLen := n.maxNodeLen()
 	cols := getColumns()
-	errWidth := min(globalTermWidth-(cols[2].Width+cols[1].Width), len(r.Err.Error()))
-	return fmt.Sprintf("%-*s %-*s %-*s %-*s\n",
-		maxNodeLen, cols[0].Style.Render(r.Node.Host),
-		cols[2].Width, cols[2].Style.Render(r.FuncName),
-		cols[1].Width, cols[1].Style.Render(r.Path),
-		errWidth, cols[3].Style.Render(r.Err.Error()[:errWidth]))
+	var errMsg string
+	errResp := minio.ToErrorResponse(r.Err)
+	if errResp.Code == "" {
+		errMsg = r.Err.Error()
+	} else {
+		errMsg = errResp.Message
+	}
+	msg1 := fmt.Sprintf("%s %s %s",
+		cols[0].Style.Width(maxNodeLen).Render(r.Node.Host), cols[2].Style.Width(15).Render(r.FuncName), cols[1].Style.Width(60).Render(r.Path))
+	msg2 := cols[3].Style.Width(120).Align(lipgloss.Left).Render(strings.TrimSpace(errMsg))
+	return lipgloss.JoinHorizontal(lipgloss.Top, msg1, msg2)
 }
