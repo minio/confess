@@ -67,7 +67,7 @@ type nodeState struct {
 func newNodeState(ctx *cli.Context) *nodeState {
 	var endpoints []string
 	var nodes []*node
-	minio.MaxRetry = 1
+	//minio.MaxRetry = 1
 
 	for _, hostStr := range ctx.Args() {
 		hosts := strings.Split(hostStr, ",")
@@ -158,6 +158,9 @@ func (n *nodeState) addWorker(ctx context.Context) {
 			case ops, ok := <-n.testCh:
 				if !ok {
 					return
+				}
+				if n.hc.allOffline() {
+					continue
 				}
 				n.runOpSeq(ctx, ops)
 			}

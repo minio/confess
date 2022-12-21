@@ -55,6 +55,17 @@ func (c *healthChecker) isOffline(ep *url.URL) bool {
 	return false
 }
 
+func (c *healthChecker) allOffline() bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	for _, h := range c.hc {
+		if h.Online {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *healthChecker) initHC(ep *url.URL) {
 	c.mutex.Lock()
 	c.hc[ep.Host] = epHealth{

@@ -41,8 +41,11 @@ type Op struct {
 }
 
 type OpSequence struct {
-	Ops []Op
+	Ops      []Op
+	RetryCnt int
 }
+
+const maxRetry = 5
 
 type testResult struct {
 	Method   string           `json:"method"`
@@ -148,6 +151,16 @@ func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 			op.NodeIdx = rand.Intn(len(n.nodes))
 			res := n.runTest(ctx, op.NodeIdx, op)
 			if res.Err != nil { // discard all other ops in this sequence
+				seq.RetryCnt += 1
+				if seq.RetryCnt <= maxRetry {
+					go n.queueTest(ctx, seq)
+				} else {
+					select {
+					case n.resCh <- res:
+					case <-ctx.Done():
+						return
+					}
+				}
 				return
 			}
 			oi = res.data
@@ -198,6 +211,14 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 		res.Node = node.endpointURL
 		return
 	}
+	defer func() {
+		if res.Err == nil || !n.hc.isOffline(node.endpointURL) {
+			return
+		}
+		res.Offline = true
+		res.Err = errNodeOffline
+		res.Node = node.endpointURL
+	}()
 	switch op.Type {
 	case http.MethodPut:
 		select {
