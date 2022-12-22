@@ -378,7 +378,6 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 			err = fmt.Errorf("metadata mismatch: %s, %s, %s,%s, %d, %d", oi.ETag, o.ObjInfo.ETag, oi.VersionID, o.ObjInfo.VersionID, oi.Size, o.Size)
 		}
 	}
-
 	return testResult{
 		Method:   http.MethodHead,
 		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),

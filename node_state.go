@@ -169,28 +169,39 @@ func (n *nodeState) addWorker(ctx context.Context) {
 }
 
 // returns latest health check status for a node
-func (n *nodeState) hcStatus(epURL *url.URL) string {
+func (n *nodeState) hcStatus(epURL *url.URL) (s statusChg) {
 	if epURL == nil {
-		return ""
+		return
 	}
-	var statusChg string
+	s.epURL = epURL
 	n.nlock.Lock()
 	_, ok := n.offlineMap[epURL.Host]
 	switch {
 	case !ok && n.hc.isOffline(epURL):
 		n.offlineMap[epURL.Host] = true
-		statusChg = "offline"
+		s.status = "offline"
 	case !n.hc.isOffline(epURL) && ok:
 		delete(n.offlineMap, epURL.Host)
-		statusChg = "online"
+		s.status = "online"
 	}
 	n.nlock.Unlock()
+	return s
+}
 
-	switch statusChg {
+type statusChg struct {
+	epURL  *url.URL
+	status string
+}
+
+func (s statusChg) String() string {
+	return fmt.Sprintf("%s is %s", s.epURL.Host, s.status)
+}
+func (s statusChg) Render() string {
+	switch s.status {
 	case "online":
-		return divider + baseStyle.Render(epURL.Host) + " is " + advisory("online") + "\n"
+		return divider + baseStyle.Render(s.epURL.Host) + " is " + advisory("online") + "\n"
 	case "offline":
-		return divider + baseStyle.Render(epURL.Host) + " is " + warn("offline") + "\n"
+		return divider + baseStyle.Render(s.epURL.Host) + " is " + warn("offline") + "\n"
 	default:
 		return ""
 	}
@@ -220,7 +231,8 @@ func (n *nodeState) init(ctx context.Context) {
 		}
 		f.WriteString(getHeader(n.cliCtx))
 		fwriter := bufio.NewWriter(f)
-
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-globalContext.Done():
@@ -239,12 +251,14 @@ func (n *nodeState) init(ctx context.Context) {
 				}
 				eraseOnce := false
 				statusChg := n.hcStatus(res.Node)
-				if statusChg != "" {
-					eraseOnce = printWithErase(eraseOnce, statusChg)
+				if statusChg.status != "" {
+					eraseOnce = printWithErase(eraseOnce, statusChg.Render())
+					if _, err := f.WriteString(statusChg.String() + "\n"); err != nil {
+						console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+					}
 				}
 				if res.Err != nil {
-					// log node offline|online toggle status or real errors
-					if !errors.Is(res.Err, errNodeOffline) || statusChg != "" {
+					if !errors.Is(res.Err, errNodeOffline) {
 						if _, err := f.WriteString(res.String() + "\n"); err != nil {
 							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 						}
@@ -270,8 +284,15 @@ func (n *nodeState) init(ctx context.Context) {
 							eraseOnce = printWithErase(eraseOnce, n.printRow(res))
 						}
 					}
+					select { // fix status bar flicker
+					case <-ticker.C:
+						printWithErase(eraseOnce, n.statusBar())
+					default:
+						if eraseOnce {
+							printWithErase(eraseOnce, n.statusBar())
+						}
+					}
 				}
-				printWithErase(eraseOnce, n.statusBar())
 			}
 		}
 	}()
@@ -382,15 +403,8 @@ func (n *nodeState) maxNodeLen() int {
 func (n *nodeState) printRow(r testResult) string {
 	maxNodeLen := n.maxNodeLen()
 	cols := getColumns()
-	var errMsg string
-	errResp := minio.ToErrorResponse(r.Err)
-	if errResp.Code == "" {
-		errMsg = r.Err.Error()
-	} else {
-		errMsg = errResp.Message
-	}
 	msg1 := fmt.Sprintf("%s %s %s",
-		cols[0].Style.Width(maxNodeLen).Render(r.Node.Host), cols[2].Style.Width(15).Render(r.FuncName), cols[1].Style.Width(60).Render(r.Path))
-	msg2 := cols[3].Style.Width(120).Align(lipgloss.Left).Render(strings.TrimSpace(errMsg))
+		cols[0].Style.Width(maxNodeLen).Render(r.Node.Host), cols[2].Style.Width(15).Render(r.FuncName), cols[1].Style.Width(48).Render(r.Path))
+	msg2 := cols[3].Style.Width(60).Render(lipgloss.JoinVertical(lipgloss.Left, strings.TrimSpace(r.Err.Error())))
 	return lipgloss.JoinHorizontal(lipgloss.Top, msg1, msg2)
 }
