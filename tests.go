@@ -430,6 +430,9 @@ func (n *nodeState) cleanup() {
 		clnt = node.client
 		break
 	}
+	if clnt == nil {
+		return
+	}
 	for _, pfx := range n.Prefixes {
 		err := clnt.RemoveObject(context.Background(), bucket, pfx, minio.RemoveObjectOptions{
 			ForceDelete: true,

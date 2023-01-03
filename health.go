@@ -16,31 +16,37 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"log"
+	"io"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/cli"
-	"github.com/minio/madmin-go"
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
-	defaultHealthCheckDuration = 1 * time.Second
+	defaultHealthCheckDuration = 2 * time.Second
 )
 
 type healthChecker struct {
-	mutex    sync.RWMutex
-	hc       map[string]epHealth
-	hcClient *madmin.AnonymousClient
+	mutex sync.RWMutex
+	hc    map[string]*hcClient
 }
 
-// epHealth struct represents health of an endpoint.
-type epHealth struct {
-	Endpoint string
-	Scheme   string
-	Online   bool
+// hcClient struct represents health of an endpoint.
+type hcClient struct {
+	EndpointURL *url.URL
+	// Scheme      string
+	Online     int32
+	httpClient *http.Client
 }
 
 // isOffline returns current liveness result of an endpoint. Add endpoint to
@@ -49,9 +55,8 @@ func (c *healthChecker) isOffline(ep *url.URL) bool {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	if h, ok := c.hc[ep.Host]; ok {
-		return !h.Online
+		return !h.isOnline()
 	}
-	go c.initHC(ep)
 	return false
 }
 
@@ -59,79 +64,187 @@ func (c *healthChecker) allOffline() bool {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	for _, h := range c.hc {
-		if h.Online {
+		if h.isOnline() {
 			return false
 		}
 	}
 	return true
 }
 
-func (c *healthChecker) initHC(ep *url.URL) {
-	c.mutex.Lock()
-	c.hc[ep.Host] = epHealth{
-		Endpoint: ep.Host,
-		Scheme:   ep.Scheme,
-		Online:   true,
-	}
-	c.mutex.Unlock()
-}
-
-func newHealthChecker(ctx *cli.Context, m map[string]epHealth) *healthChecker {
+func newHealthChecker(ctx *cli.Context, m map[string]*hcClient) *healthChecker {
 	hc := healthChecker{
-		hc:       m,
-		hcClient: newHCClient(ctx),
+		hc: m,
 	}
 	go hc.heartBeat(globalContext)
 	return &hc
 }
 
-// newHCClient initializes an anonymous client for performing health check on the remote endpoints
-func newHCClient(ctx *cli.Context) *madmin.AnonymousClient {
-	clnt, e := madmin.NewAnonymousClientNoEndpoint()
-	if e != nil {
-		log.Fatal(fmt.Errorf("WARNING: Unable to initialize health check client"))
-		return nil
-	}
-	tr := clientTransport(ctx, false)
-	clnt.SetCustomTransport(tr)
-	return clnt
+func (h *hcClient) setOffline() {
+	atomic.StoreInt32(&h.Online, 0)
 }
 
+func (h *hcClient) setOnline() {
+	atomic.StoreInt32(&h.Online, 1)
+}
+func (h *hcClient) isOnline() bool {
+	return atomic.LoadInt32(&h.Online) == 1
+}
+
+type epHealth struct {
+	Online   bool
+	Endpoint *url.URL
+	Error    error
+}
+
+// healthCheck - background routine which checks if a backend is up or down.
 func (h *healthChecker) heartBeat(ctx context.Context) {
 	hcTimer := time.NewTimer(defaultHealthCheckDuration)
 	defer hcTimer.Stop()
 	for {
 		select {
 		case <-hcTimer.C:
-			h.mutex.RLock()
-			var eps []madmin.ServerProperties
-			for _, ep := range h.hc {
-				eps = append(eps, madmin.ServerProperties{Endpoint: ep.Endpoint, Scheme: ep.Scheme})
-			}
-			h.mutex.RUnlock()
-
-			if len(eps) > 0 {
-				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				m := map[string]epHealth{}
-				for result := range h.hcClient.Alive(cctx, madmin.AliveOpts{}, eps...) {
-					var online bool
-					if result.Error == nil {
-						online = result.Online
-					}
-					m[result.Endpoint.Host] = epHealth{
-						Endpoint: result.Endpoint.Host,
-						Scheme:   result.Endpoint.Scheme,
-						Online:   online,
-					}
+			for result := range h.healthCheck(ctx) {
+				fmt.Println(result)
+				var online bool
+				if result.Error == nil || result.Online {
+					online = result.Online
 				}
-				cancel()
-				h.mutex.Lock()
-				h.hc = m
-				h.mutex.Unlock()
+				if hcClient, ok := h.hc[result.Endpoint.Host]; ok {
+					if online {
+						hcClient.setOnline()
+					} else {
+						hcClient.setOffline()
+					}
+					h.mutex.Lock()
+					h.hc[result.Endpoint.Host] = hcClient
+					h.mutex.Unlock()
+				}
 			}
 			hcTimer.Reset(defaultHealthCheckDuration)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+func (h *healthChecker) healthCheck(ctx context.Context) (resultsCh chan epHealth) {
+	resultsCh = make(chan epHealth)
+	go func() {
+		defer close(resultsCh)
+		var wg sync.WaitGroup
+		wg.Add(len(h.hc))
+		for _, hcClient := range h.hc {
+			hcClient := hcClient
+
+			go func() {
+				defer wg.Done()
+				err := hcClient.healthCheck(ctx, resultsCh)
+				if err != nil {
+					resultsCh <- epHealth{
+						Error: err,
+					}
+					return
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+	return resultsCh
+}
+
+func (hc *hcClient) healthCheck(ctx context.Context, resultsCh chan epHealth) error {
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hc.EndpointURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := hc.httpClient.Do(req)
+	if err == nil {
+		// Drain the connection.
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	result := epHealth{
+		Endpoint: hc.EndpointURL,
+	}
+	if err != nil || (err == nil && resp.StatusCode != http.StatusForbidden) {
+		// observed an error, take the backend down.
+	} else {
+		result.Online = true
+	}
+
+	if err != nil {
+		result.Error = err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case resultsCh <- result:
+	}
+	return nil
+}
+
+// DefaultTransport - this default transport is similar to
+// http.DefaultTransport but with additional param  DisableCompression
+// is set to true to avoid decompressing content with 'gzip' encoding.
+var DefaultTransport = func(secure bool) http.RoundTripper {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:       5 * time.Second,
+			KeepAlive:     15 * time.Second,
+			FallbackDelay: 100 * time.Millisecond,
+		}).DialContext,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		ResponseHeaderTimeout: 60 * time.Second,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Set this value so that the underlying transport round-tripper
+		// doesn't try to auto decode the body of objects with
+		// content-encoding set to `gzip`.
+		//
+		// Refer:
+		//    https://golang.org/src/net/http/transport.go?h=roundTrip#L1843
+		DisableCompression: true,
+	}
+
+	if secure {
+		tr.TLSClientConfig = &tls.Config{
+			// Can't use SSLv3 because of POODLE and BEAST
+			// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
+			// Can't use TLSv1.1 because of RC4 cipher usage
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	return tr
+}
+
+const (
+	Offline = 0
+	Online  = 1
+)
+
+// newHCClient creates a new health check client
+func newHCClient(epURL *url.URL) (hc hcClient, err error) {
+	// Initialize cookies to preserve server sent cookies if any and replay
+	// them upon each request.
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return hc, err
+	}
+
+	// Save endpoint URL, user agent for future uses.
+	hc.EndpointURL = epURL
+
+	// default online to true
+	atomic.StoreInt32(&hc.Online, Online)
+	// Instantiate http client and bucket location cache.
+	hc.httpClient = &http.Client{
+		Jar:       jar,
+		Transport: DefaultTransport(epURL.Scheme == "https"),
+	}
+
+	return hc, nil
 }

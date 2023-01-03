@@ -89,7 +89,7 @@ func newNodeState(ctx *cli.Context) *nodeState {
 		}
 	}
 
-	hcMap := make(map[string]epHealth)
+	hcMap := make(map[string]*hcClient)
 	for _, endpoint := range endpoints {
 		endpoint = strings.TrimSuffix(endpoint, slashSeparator)
 		target, err := url.Parse(endpoint)
@@ -117,11 +117,11 @@ func newNodeState(ctx *cli.Context) *nodeState {
 			client:      clnt,
 		}
 		nodes = append(nodes, n)
-		hcMap[target.Host] = epHealth{
-			Endpoint: target.Host,
-			Scheme:   target.Scheme,
-			Online:   true,
+		hcClient, err := newHCClient(target)
+		if err != nil {
+			console.Fatalln(fmt.Errorf("could not initialize client for %s", endpoint))
 		}
+		hcMap[target.Host] = &hcClient
 	}
 	var pfxes []string
 	for i := 0; i < 10; i++ {

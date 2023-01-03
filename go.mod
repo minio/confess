@@ -6,6 +6,7 @@ require (
 	github.com/charmbracelet/lipgloss v0.6.0
 	github.com/cheggaaa/pb v1.0.29
 	github.com/dustin/go-humanize v1.0.0
+	github.com/fatih/color v1.13.0
 	github.com/lithammer/shortuuid/v4 v4.0.0
 	github.com/minio/cli v1.24.0
 	github.com/minio/console v0.21.2
@@ -13,12 +14,12 @@ require (
 	github.com/minio/md5-simd v1.1.2
 	github.com/minio/minio-go/v7 v7.0.41
 	github.com/minio/pkg v1.5.4
-	golang.org/x/net v0.1.0
+	github.com/prometheus-community/pro-bing v0.1.0
+	golang.org/x/net v0.4.0
 )
 
 require (
 	github.com/aymanbagabas/go-osc52 v1.2.1 // indirect
-	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -48,7 +49,8 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.2 // indirect
 	golang.org/x/crypto v0.1.0 // indirect
 	golang.org/x/sync v0.1.0 // indirect
-	golang.org/x/sys v0.1.0 // indirect
-	golang.org/x/text v0.4.0 // indirect
+	golang.org/x/sys v0.3.0 // indirect
+	golang.org/x/text v0.5.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
+// replace github.com/minio/minio-go/v7 => ../minio-go
