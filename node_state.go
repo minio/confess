@@ -159,10 +159,7 @@ func (n *nodeState) addWorker(ctx context.Context) {
 				if !ok {
 					return
 				}
-				if n.hc.allOffline() {
-					continue
-				}
-				n.runOpSeq(ctx, ops)
+				ops.Test(ctx, ops.Retry)
 			}
 		}
 	}()
@@ -253,12 +250,12 @@ func (n *nodeState) init(ctx context.Context) {
 				statusChg := n.hcStatus(res.Node)
 				if statusChg.status != "" {
 					eraseOnce = printWithErase(eraseOnce, statusChg.Render())
-					if _, err := f.WriteString(statusChg.String() + "\n"); err != nil {
+					if _, err := f.WriteString(fmt.Sprintf("%s %s %s\n", res.StartTime.Format(time.RFC3339Nano), res.EndTime.Format(time.RFC3339Nano), statusChg.String())); err != nil {
 						console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 					}
 				}
 				if res.Err != nil {
-					if !errors.Is(res.Err, errNodeOffline) {
+					if !errors.Is(res.Err, errNodeOffline) && !res.RetryRequest {
 						if _, err := f.WriteString(res.String() + "\n"); err != nil {
 							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 						}
@@ -270,7 +267,9 @@ func (n *nodeState) init(ctx context.Context) {
 					// summarize the stats here
 					atomic.AddInt32(&n.numTests, 1)
 					if res.Err != nil {
-						atomic.AddInt32(&n.numFailed, 1)
+						if !res.RetryRequest {
+							atomic.AddInt32(&n.numFailed, 1)
+						}
 					} else {
 						totsuccess++
 					}

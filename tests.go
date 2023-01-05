@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sync"
 	"time"
 
@@ -32,30 +33,35 @@ import (
 )
 
 type Op struct {
-	Type      string
-	ObjInfo   minio.ObjectInfo
-	Key       string
-	VersionID string
-	Prefix    string
-	NodeIdx   int // node at which to run operation
+	minio.ObjectInfo
+	Type          string
+	Prefix        string
+	ExpectedCount int // for listing
+	NodeIdx       int // node at which to run operation
 }
 
+type RetryInfo struct {
+	OK      bool // retries GET|HEAD|LIST operation
+	ObjInfo minio.ObjectInfo
+}
 type OpSequence struct {
-	Ops      []Op
-	RetryCnt int
+	Test  func(ctx context.Context, r RetryInfo)
+	Retry RetryInfo
 }
-
-const maxRetry = 5
 
 type testResult struct {
-	Method   string           `json:"method"`
-	FuncName string           `json:"funcName"`
-	Path     string           `json:"path"`
-	Node     *url.URL         `json:"node"`
-	Err      error            `json:"err,omitempty"`
-	Latency  time.Duration    `json:"duration"`
-	Offline  bool             `json:"offline"`
-	data     minio.ObjectInfo `json:"-"`
+	Method       string        `json:"method"`
+	FuncName     string        `json:"funcName"`
+	Path         string        `json:"path"`
+	Node         *url.URL      `json:"node"`
+	Err          error         `json:"err,omitempty"`
+	Latency      time.Duration `json:"duration"`
+	Offline      bool          `json:"offline"`
+	RetryRequest bool          `json:"retry"`
+	TestFn       func(context.Context)
+	data         minio.ObjectInfo `json:"-"`
+	StartTime    time.Time        `json:"startTime"`
+	EndTime      time.Time        `json:"endTime"`
 }
 
 func (r *testResult) String() string {
@@ -63,12 +69,11 @@ func (r *testResult) String() string {
 	if r.Err != nil {
 		errMsg = r.Err.Error()
 	}
-	return fmt.Sprintf("%s: %s %s %s %s", r.Node, r.Path, r.Method, r.FuncName, errMsg)
+	return fmt.Sprintf("%s %s %s: %s %s %s %s", r.StartTime.Format(time.RFC3339Nano), r.EndTime.Format(time.RFC3339Nano), r.Node, r.Path, r.Method, r.FuncName, errMsg)
 }
 
 var (
-	errInvalidOpSeq = fmt.Errorf("invalid op sequence")
-	errNodeOffline  = fmt.Errorf("node is offline")
+	errNodeOffline = fmt.Errorf("node is offline")
 )
 
 // prints line to console - erase status bar if erased is true
@@ -90,27 +95,24 @@ func (n *nodeState) queueTest(ctx context.Context, op OpSequence) {
 }
 
 // generate a sequence of S3 API operations
-func (n *nodeState) generateOpSequence() (seq OpSequence) {
-	pfx := n.getRandomPfx()
-	object := fmt.Sprintf("%s/%s", pfx, shortuuid.New())
-	seq.Ops = append(seq.Ops, Op{Type: http.MethodPut, Key: object})
-	for i := 0; i < 5; i++ {
-		idx := rand.Intn(3)
-		var op Op
-		op.Key = object
-		op.Prefix = pfx
-		switch idx {
-		case 0:
-			op.Type = http.MethodGet
-		case 1:
-			op.Type = http.MethodHead
-		case 2:
-			op.Type = "LIST"
-		}
-		seq.Ops = append(seq.Ops, op)
+func (n *nodeState) generateTest() (seq OpSequence) {
+	tIdx := rand.Intn(6)
+	switch tIdx {
+	case 0:
+		seq.Test = n.testHeadWithVersion
+	case 1:
+		seq.Test = n.testGetWithVersion
+	case 2:
+		seq.Test = n.testListObject
+	case 3:
+		seq.Test = n.testHeadAfterMultipartUpload
+	case 4:
+		seq.Test = n.testGetAfterMultipartUpload
+	case 5:
+		seq.Test = n.testListAfterMultipartUpload
 	}
-	seq.Ops = append(seq.Ops, Op{Type: http.MethodDelete, Key: object})
-	return seq
+	return
+
 }
 
 func (n *nodeState) runTests(ctx context.Context) (err error) {
@@ -120,66 +122,46 @@ func (n *nodeState) runTests(ctx context.Context) (err error) {
 			close(n.testCh)
 			return
 		default:
-			seq := n.generateOpSequence()
+			seq := n.generateTest()
 			n.queueTest(ctx, seq)
 		}
 	}
 }
 
-// validate if op sequence has PUT and DELETE as first and last ops.
-func validateOpSequence(seq OpSequence) error {
-	if len(seq.Ops) < 2 {
-		return errInvalidOpSeq
-	}
-	if seq.Ops[0].Type != http.MethodPut {
-		return errInvalidOpSeq
-	}
-	if seq.Ops[len(seq.Ops)-1].Type != http.MethodDelete {
-		return errInvalidOpSeq
-	}
-	return nil
+func (n *nodeState) genObjName() string {
+	pfx := n.getRandomPfx()
+	return fmt.Sprintf("%s/%s", pfx, shortuuid.New())
 }
+func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
 
-func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
-	var oi minio.ObjectInfo
-	if err := validateOpSequence(seq); err != nil {
-		console.Errorln(err)
-		return
-	}
-	for _, op := range seq.Ops {
-		if op.Type == http.MethodPut {
-			op.NodeIdx = rand.Intn(len(n.nodes))
-			res := n.runTest(ctx, op.NodeIdx, op)
-			if res.Err != nil { // discard all other ops in this sequence
-				seq.RetryCnt += 1
-				if seq.RetryCnt <= maxRetry {
-					go n.queueTest(ctx, seq)
-				} else {
-					select {
-					case n.resCh <- res:
-					case <-ctx.Done():
-						return
-					}
-				}
-				return
-			}
-			oi = res.data
-			select {
-			case n.resCh <- res:
-			case <-ctx.Done():
-				return
-			}
-			continue
+	op := Op{
+		Type: http.MethodPut,
+		ObjectInfo: minio.ObjectInfo{
+			Key:  n.genObjName(),
+			Size: 4 * humanize.KiByte,
+		}}
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+	} else {
+		res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+		select {
+		case n.resCh <- res:
+		case <-ctx.Done():
+			return
 		}
-		if op.Type == http.MethodDelete {
-			op.NodeIdx = rand.Intn(len(n.nodes))
-			res := n.runTest(ctx, op.NodeIdx, op)
-			select {
-			case n.resCh <- res:
-			case <-ctx.Done():
-				return
-			}
-			continue
+	}
+	var requeue bool
+
+	if res.Err == nil {
+		op := Op{
+			Type: http.MethodGet,
+			ObjectInfo: minio.ObjectInfo{
+				Key:       res.data.Key,
+				VersionID: res.data.VersionID,
+				ETag:      res.data.ETag,
+				Size:      res.data.Size,
+			},
 		}
 		var wg sync.WaitGroup
 		for i := 0; i < len(n.nodes); i++ {
@@ -187,37 +169,408 @@ func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 			go func(i int, op Op) {
 				defer wg.Done()
 				op.NodeIdx = i
-				op.ObjInfo.VersionID = oi.VersionID
-				op.ObjInfo.ETag = oi.ETag
-				op.ObjInfo.Size = oi.Size
+				gres := n.runTest(ctx, op.NodeIdx, op)
+				select {
+				case n.resCh <- gres:
+				case <-ctx.Done():
+					return
+				}
+				if gres.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testGetWithVersion,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
+			}(i, op)
+		}
+		wg.Wait()
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
+	mpartSize := len(n.nodes) * humanize.MiByte * 5
+	op := Op{
+		Type: "MULTIPART",
+		ObjectInfo: minio.ObjectInfo{
+			Key:  n.genObjName(),
+			Size: int64(mpartSize),
+		}}
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+	} else {
+		res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+		select {
+		case n.resCh <- res:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var requeue bool
+	if res.Err == nil && res.FuncName == "CompleteMultipartUpload" {
+		op := Op{
+			Type: http.MethodGet,
+			ObjectInfo: minio.ObjectInfo{
+				Key:       res.data.Key,
+				VersionID: res.data.VersionID,
+				ETag:      res.data.ETag,
+				Size:      res.data.Size,
+			},
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < len(n.nodes); i++ {
+			wg.Add(1)
+			go func(i int, op Op) {
+				defer wg.Done()
+				op.NodeIdx = i
 				res2 := n.runTest(ctx, op.NodeIdx, op)
 				select {
 				case n.resCh <- res2:
 				case <-ctx.Done():
 					return
 				}
+				if res2.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testGetAfterMultipartUpload,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
 			}(i, op)
 		}
 		wg.Wait()
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (n *nodeState) testHeadWithVersion(ctx context.Context, retry RetryInfo) {
+	op := Op{
+		Type: http.MethodPut,
+		ObjectInfo: minio.ObjectInfo{
+			Key:  n.genObjName(),
+			Size: 4 * humanize.KiByte,
+			UserMetadata: map[string]string{
+				"Customkey": "extra  spaces  in   value",
+				"Key2":      "Confess",
+			},
+		}}
+
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+	} else {
+		res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+		select {
+		case n.resCh <- res:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var requeue bool
+
+	if res.Err == nil {
+		op.Type = http.MethodHead
+		res.data.UserMetadata = op.UserMetadata
+		op.ObjectInfo = res.data
+		var wg sync.WaitGroup
+		for i := 0; i < len(n.nodes); i++ {
+			wg.Add(1)
+			go func(i int, op Op) {
+				defer wg.Done()
+				op.NodeIdx = i
+				res2 := n.runTest(ctx, op.NodeIdx, op)
+				select {
+				case n.resCh <- res2:
+				case <-ctx.Done():
+					return
+				}
+				if res2.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testHeadWithVersion,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
+			}(i, op)
+		}
+		wg.Wait()
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (n *nodeState) testHeadAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
+	mpartSize := len(n.nodes) * humanize.MiByte * 5
+	op := Op{
+		Type: "MULTIPART",
+		ObjectInfo: minio.ObjectInfo{
+			Key:  n.genObjName(),
+			Size: int64(mpartSize),
+			UserMetadata: map[string]string{
+				"Customkey": "extra  spaces  in   value",
+				"Key2":      "Confess",
+			},
+		}}
+
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+	} else {
+		res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+		select {
+		case n.resCh <- res:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var requeue bool
+
+	if res.Err == nil && res.FuncName == "CompleteMultipartUpload" {
+		op.Type = http.MethodHead
+		res.data.UserMetadata = op.UserMetadata
+		op.ObjectInfo = minio.ObjectInfo{
+			Key:       res.data.Key,
+			VersionID: res.data.VersionID,
+			ETag:      res.data.ETag,
+			Size:      res.data.Size,
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < len(n.nodes); i++ {
+			wg.Add(1)
+			go func(i int, op Op) {
+				defer wg.Done()
+				op.NodeIdx = i
+				res2 := n.runTest(ctx, op.NodeIdx, op)
+				select {
+				case n.resCh <- res2:
+				case <-ctx.Done():
+					return
+				}
+				if res2.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testHeadAfterMultipartUpload,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
+			}(i, op)
+		}
+		wg.Wait()
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
+	count := 0
+	object := n.genObjName()
+	op := Op{
+		Type: http.MethodPut,
+		ObjectInfo: minio.ObjectInfo{
+			Key:  object,
+			Size: 4 * humanize.KiByte,
+		}}
+
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+		count += 1
+	} else {
+		for i := 0; i < 2; i++ {
+			res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+			if res.Err == nil {
+				count++
+			}
+		}
+	}
+	var requeue bool
+
+	if count > 0 {
+		var wg sync.WaitGroup
+		for i := 0; i < len(n.nodes); i++ {
+			wg.Add(1)
+			op := Op{
+				Prefix:        object,
+				NodeIdx:       i,
+				Type:          "LIST",
+				ExpectedCount: count,
+			}
+			go func(i int, op Op) {
+				defer wg.Done()
+				op.NodeIdx = i
+				res2 := n.runTest(ctx, op.NodeIdx, op)
+				select {
+				case n.resCh <- res2:
+				case <-ctx.Done():
+					return
+				}
+				if res2.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testListObject,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
+
+			}(i, op)
+		}
+		wg.Wait()
+
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+func (n *nodeState) testListAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
+	mpartSize := len(n.nodes) * humanize.MiByte * 5
+	op := Op{
+		Type: "MULTIPART",
+		ObjectInfo: minio.ObjectInfo{
+			Key:  n.genObjName(),
+			Size: int64(mpartSize),
+		}}
+	var res testResult
+	if retry.OK {
+		res.data = retry.ObjInfo
+	} else {
+		res = n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+		select {
+		case n.resCh <- res:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var requeue bool
+
+	if (res.Err == nil && res.FuncName == "CompleteMultipartUpload") || retry.OK {
+		op.Type = http.MethodHead
+		res.data.UserMetadata = op.UserMetadata
+		op.ObjectInfo = minio.ObjectInfo{
+			Key:       res.data.Key,
+			VersionID: res.data.VersionID,
+			ETag:      res.data.ETag,
+			Size:      res.data.Size,
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < len(n.nodes); i++ {
+			wg.Add(1)
+			op := Op{
+				Prefix:        res.data.Key,
+				NodeIdx:       i,
+				Type:          "LIST",
+				ExpectedCount: 1,
+			}
+			go func(i int, op Op) {
+				defer wg.Done()
+				op.NodeIdx = i
+				res2 := n.runTest(ctx, op.NodeIdx, op)
+				select {
+				case n.resCh <- res2:
+				case <-ctx.Done():
+					return
+				}
+				if res2.RetryRequest {
+					go n.queueTest(ctx, OpSequence{
+						Test:  n.testListAfterMultipartUpload,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+					})
+					requeue = true
+				}
+			}(i, op)
+		}
+		wg.Wait()
+
+		if !requeue {
+			op.Type = http.MethodDelete
+			res := n.runTest(ctx, rand.Intn(len(n.nodes)), op)
+			select {
+			case n.resCh <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
 }
 
 func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult) {
 	bucket := n.cliCtx.String("bucket")
 	node := n.nodes[idx]
+	startTime := time.Now().UTC()
+
 	if n.hc.isOffline(node.endpointURL) {
-		res.Offline = true
-		res.Err = errNodeOffline
-		res.Node = node.endpointURL
+		res = testResult{
+			Offline:   true,
+			Err:       errNodeOffline,
+			Node:      node.endpointURL,
+			StartTime: startTime,
+			EndTime:   time.Now().UTC(),
+		}
 		return
 	}
 	defer func() {
-		if res.Err == nil || !n.hc.isOffline(node.endpointURL) {
+		res.StartTime = startTime
+		res.EndTime = time.Now().UTC()
+		if res.Err == nil {
 			return
 		}
-		res.Offline = true
-		res.Err = errNodeOffline
-		res.Node = node.endpointURL
+		errResp := minio.ToErrorResponse(res.Err)
+		if minio.IsNetworkOrHostDown(res.Err, false) ||
+			n.hc.isOffline(node.endpointURL) ||
+			errResp.StatusCode == http.StatusServiceUnavailable {
+			res.Err = errNodeOffline
+			res.RetryRequest = true
+			res.Node = node.endpointURL
+			return
+		}
+		switch {
+		case errResp == minio.ErrorResponse{}:
+			res.RetryRequest = true
+		case errResp.Code == "InternalError":
+			res.RetryRequest = true
+		}
 	}()
 	switch op.Type {
 	case http.MethodPut:
@@ -225,12 +578,14 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 		case <-ctx.Done():
 			return
 		default:
-			res = n.put(ctx, putOpts{
+			popts := putOpts{
 				Bucket:  bucket,
 				Object:  op.Key,
 				NodeIdx: idx,
-				Size:    4 * humanize.KiByte,
-			})
+				Size:    op.Size,
+			}
+			popts.UserMetadata = op.UserMetadata
+			res = n.put(ctx, popts)
 			return
 		}
 	case http.MethodGet:
@@ -240,7 +595,7 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 				Bucket:  bucket,
 				Object:  op.Key,
 				NodeIdx: idx,
-				ObjInfo: op.ObjInfo,
+				ObjInfo: op.ObjectInfo,
 			})
 			return
 		case <-ctx.Done():
@@ -254,7 +609,7 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 				Bucket:  bucket,
 				Object:  op.Key,
 				NodeIdx: idx,
-				ObjInfo: op.ObjInfo,
+				ObjInfo: op.ObjectInfo,
 			})
 			return
 		case <-ctx.Done():
@@ -276,11 +631,25 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 	case "LIST":
 		select {
 		default:
-			res = n.list(ctx, listOpts{
+			res = n.list(ctx, op.ExpectedCount, listOpts{
 				Bucket:  bucket,
 				Prefix:  op.Prefix,
 				NodeIdx: idx,
 			})
+			return
+		case <-ctx.Done():
+			return
+		}
+	case "MULTIPART":
+		select {
+		default:
+			popts := putOpts{
+				Bucket: bucket,
+				Object: op.Key,
+				Size:   op.Size,
+			}
+			popts.UserMetadata = op.UserMetadata
+			res = n.multipartPut(ctx, popts)
 			return
 		case <-ctx.Done():
 			return
@@ -307,7 +676,8 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
-	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), minio.PutObjectOptions{ContentType: "binary/octet-stream"})
+	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), o.PutObjectOptions)
+
 	return testResult{
 		Method:   http.MethodPut,
 		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),
@@ -319,6 +689,92 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 	}
 }
 
+func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult) {
+	start := time.Now()
+	reader := getDataReader(o.Size)
+	defer reader.Close()
+	node := n.nodes[o.NodeIdx]
+	if n.hc.isOffline(node.endpointURL) {
+		res.Offline = true
+		res.Err = errNodeOffline
+		return
+	}
+	res = testResult{
+		Method:   http.MethodPost,
+		FuncName: "NewMultipartUpload",
+		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		Node:     node.endpointURL,
+	}
+	var uploadedParts []minio.CompletePart
+	c := minio.Core{Client: node.client}
+
+	uploadID, err := c.NewMultipartUpload(context.Background(), o.Bucket, o.Object, o.PutObjectOptions)
+	if err != nil {
+		res.Err = err
+		return
+	}
+
+	defer func() {
+		if err != nil {
+			aerr := c.AbortMultipartUpload(ctx, o.Bucket, o.Object, uploadID)
+			res.Err = aerr
+			res.FuncName = "AbortMultipartUpload"
+			res.Method = http.MethodPost
+			return
+		}
+	}()
+	mpartSize := o.Size
+	partSize := int64(humanize.MiByte * 5)
+	res.FuncName = "PutObjectPart"
+
+	for i, node := range n.nodes {
+		clnt := minio.Core{Client: node.client}
+		if n.hc.isOffline(node.endpointURL) {
+			continue
+		}
+		var (
+			pInfo minio.ObjectPart
+		)
+		mpartSize -= int64(partSize)
+		if i == len(n.nodes) && mpartSize > 0 {
+			partSize += int64(mpartSize)
+		}
+		reader := getDataReader(partSize)
+		defer reader.Close()
+
+		pInfo, err = clnt.PutObjectPart(ctx, o.Bucket, o.Object, uploadID, i+1, reader, partSize, "", "", o.ServerSideEncryption)
+		if err != nil {
+			res.Err = err
+			return
+		}
+		if pInfo.Size != partSize {
+			err = fmt.Errorf("part size mismatch: got %d, want %d", pInfo.Size, partSize)
+			res.Err = err
+			return
+		}
+		uploadedParts = append(uploadedParts, minio.CompletePart{
+			PartNumber: pInfo.PartNumber,
+			ETag:       pInfo.ETag,
+		})
+	}
+	var etag string
+	etag, err = c.CompleteMultipartUpload(ctx, o.Bucket, o.Object, uploadID, uploadedParts, minio.PutObjectOptions{})
+
+	return testResult{
+		Method:   http.MethodPut,
+		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		FuncName: "CompleteMultipartUpload",
+		Err:      err,
+		Node:     n.nodes[o.NodeIdx].endpointURL,
+		Latency:  time.Since(start),
+		data: minio.ObjectInfo{
+			Key:          o.Object,
+			ETag:         etag,
+			Size:         o.Size,
+			UserMetadata: o.UserMetadata,
+		},
+	}
+}
 func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 	start := time.Now()
 
@@ -368,14 +824,20 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
-	opts := minio.StatObjectOptions{}
+	opts := minio.StatObjectOptions{VersionID: o.VersionID}
 	opts.SetMatchETag(o.ObjInfo.ETag)
 	oi, err := node.client.StatObject(ctx, o.Bucket, o.Object, opts)
 	if err == nil {
+		// compare ETag, size and version id if available
 		if oi.ETag != o.ObjInfo.ETag ||
-			oi.VersionID != o.ObjInfo.VersionID ||
+			(oi.VersionID != o.ObjInfo.VersionID && o.ObjInfo.VersionID != "") ||
 			oi.Size != o.ObjInfo.Size {
 			err = fmt.Errorf("metadata mismatch: %s, %s, %s,%s, %d, %d", oi.ETag, o.ObjInfo.ETag, oi.VersionID, o.ObjInfo.VersionID, oi.Size, o.Size)
+		}
+	}
+	if err == nil && len(o.ObjInfo.UserMetadata) > 0 {
+		if !reflect.DeepEqual(o.ObjInfo.UserMetadata, oi.UserMetadata) {
+			err = fmt.Errorf("metadata mismatch of user defined metadata")
 		}
 	}
 	return testResult{
@@ -443,11 +905,12 @@ func (n *nodeState) cleanup() {
 	}
 }
 
-func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
+func (n *nodeState) list(ctx context.Context, numEntries int, o listOpts) (res testResult) {
 	start := time.Now()
+	path := fmt.Sprintf("%s/%s", o.Bucket, o.Prefix)
 	res = testResult{
 		Method:   "LIST",
-		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Prefix),
+		Path:     path,
 		Node:     n.nodes[o.NodeIdx].endpointURL,
 		FuncName: "ListObjects",
 	}
@@ -459,6 +922,7 @@ func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
 	}
 	doneCh := make(chan struct{})
 	defer close(doneCh)
+	saw := 0
 	for objCh := range node.client.ListObjects(ctx, o.Bucket, minio.ListObjectsOptions{
 		Prefix:       o.Prefix,
 		Recursive:    true,
@@ -469,6 +933,10 @@ func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
 			res.Latency = time.Since(start)
 			return
 		}
+		saw++
+	}
+	if saw != numEntries {
+		res.Err = fmt.Errorf("mismatch in number of versions: expected %d , saw %d for %s", numEntries, saw, path)
 	}
 	return testResult{
 		Method:   "LIST",
@@ -496,11 +964,10 @@ func toObjectInfo(o minio.UploadInfo) minio.ObjectInfo {
 
 type putOpts struct {
 	minio.PutObjectOptions
-	Bucket       string
-	Object       string
-	Size         int64
-	UserMetadata map[string]string
-	NodeIdx      int
+	Bucket  string
+	Object  string
+	Size    int64
+	NodeIdx int
 }
 
 type getOpts struct {

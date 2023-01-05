@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -104,7 +103,6 @@ func (h *healthChecker) heartBeat(ctx context.Context) {
 		select {
 		case <-hcTimer.C:
 			for result := range h.healthCheck(ctx) {
-				fmt.Println(result)
 				var online bool
 				if result.Error == nil || result.Online {
 					online = result.Online
