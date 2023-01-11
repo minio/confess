@@ -56,11 +56,13 @@ type TestStats struct {
 }
 
 func (s TestStats) ThroughputPerSec() uint64 {
-	if s.LatencyCumulative == 0 {
+	duration := uint64(s.LatencyCumulative.Seconds())
+	if duration == 0 {
 		return 0
 	}
-	return s.TotalBytesWritten / uint64(s.LatencyCumulative.Seconds())
+	return s.TotalBytesWritten / duration
 }
+
 func (s TestStats) AvgLatency() time.Duration {
 	if s.TotalTests == 0 {
 		return 0
