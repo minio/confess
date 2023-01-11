@@ -32,6 +32,11 @@ import (
 	"github.com/minio/pkg/console"
 )
 
+const (
+	MultipartType = "MULTIPART"
+	ListType      = "LIST"
+)
+
 type Op struct {
 	minio.ObjectInfo
 	Type          string
@@ -112,7 +117,6 @@ func (n *nodeState) generateTest() (seq OpSequence) {
 		seq.Test = n.testListAfterMultipartUpload
 	}
 	return
-
 }
 
 func (n *nodeState) runTests(ctx context.Context) (err error) {
@@ -122,6 +126,9 @@ func (n *nodeState) runTests(ctx context.Context) (err error) {
 			close(n.testCh)
 			return
 		default:
+			if n.hc.allOffline() {
+				continue
+			}
 			seq := n.generateTest()
 			n.queueTest(ctx, seq)
 		}
@@ -200,7 +207,7 @@ func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
 func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
 	mpartSize := len(n.nodes) * humanize.MiByte * 5
 	op := Op{
-		Type: "MULTIPART",
+		Type: MultipartType,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -327,7 +334,7 @@ func (n *nodeState) testHeadWithVersion(ctx context.Context, retry RetryInfo) {
 func (n *nodeState) testHeadAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
 	mpartSize := len(n.nodes) * humanize.MiByte * 5
 	op := Op{
-		Type: "MULTIPART",
+		Type: MultipartType,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -429,7 +436,7 @@ func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
 			op := Op{
 				Prefix:        object,
 				NodeIdx:       i,
-				Type:          "LIST",
+				Type:          ListType,
 				ExpectedCount: count,
 			}
 			go func(i int, op Op) {
@@ -467,7 +474,7 @@ func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
 func (n *nodeState) testListAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
 	mpartSize := len(n.nodes) * humanize.MiByte * 5
 	op := Op{
-		Type: "MULTIPART",
+		Type: MultipartType,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -500,7 +507,7 @@ func (n *nodeState) testListAfterMultipartUpload(ctx context.Context, retry Retr
 			op := Op{
 				Prefix:        res.data.Key,
 				NodeIdx:       i,
-				Type:          "LIST",
+				Type:          ListType,
 				ExpectedCount: 1,
 			}
 			go func(i int, op Op) {
@@ -628,7 +635,7 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 		case <-ctx.Done():
 			return
 		}
-	case "LIST":
+	case ListType:
 		select {
 		default:
 			res = n.list(ctx, op.ExpectedCount, listOpts{
@@ -640,7 +647,7 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 		case <-ctx.Done():
 			return
 		}
-	case "MULTIPART":
+	case MultipartType:
 		select {
 		default:
 			popts := putOpts{
@@ -661,7 +668,6 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 }
 
 func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
-	start := time.Now()
 	reader := getDataReader(o.Size)
 	defer reader.Close()
 	node := n.nodes[o.NodeIdx]
@@ -676,8 +682,9 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
-	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), o.PutObjectOptions)
+	start := time.Now()
 
+	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), o.PutObjectOptions)
 	return testResult{
 		Method:   http.MethodPut,
 		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),
@@ -690,7 +697,6 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 }
 
 func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult) {
-	start := time.Now()
 	reader := getDataReader(o.Size)
 	defer reader.Close()
 	node := n.nodes[o.NodeIdx]
@@ -707,6 +713,7 @@ func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult
 	}
 	var uploadedParts []minio.CompletePart
 	c := minio.Core{Client: node.client}
+	start := time.Now()
 
 	uploadID, err := c.NewMultipartUpload(context.Background(), o.Bucket, o.Object, o.PutObjectOptions)
 	if err != nil {
@@ -776,7 +783,6 @@ func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult
 	}
 }
 func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
-	start := time.Now()
 
 	node := n.nodes[o.NodeIdx]
 	res = testResult{
@@ -790,6 +796,8 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
+	start := time.Now()
+
 	opts := minio.GetObjectOptions{}
 	opts.SetMatchETag(o.ObjInfo.ETag)
 	obj, err := node.client.GetObject(ctx, o.Bucket, o.Object, opts)
@@ -800,6 +808,7 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 			oi, err = obj.Stat()
 		}
 	}
+
 	return testResult{
 		Method:   http.MethodGet,
 		FuncName: "GetObject",
@@ -812,7 +821,6 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 }
 
 func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
-	start := time.Now()
 	node := n.nodes[o.NodeIdx]
 	res = testResult{
 		Method: http.MethodHead,
@@ -824,6 +832,8 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
+	start := time.Now()
+
 	opts := minio.StatObjectOptions{VersionID: o.VersionID}
 	opts.SetMatchETag(o.ObjInfo.ETag)
 	oi, err := node.client.StatObject(ctx, o.Bucket, o.Object, opts)
@@ -853,7 +863,6 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 }
 
 func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
-	start := time.Now()
 	node := n.nodes[o.NodeIdx]
 
 	res = testResult{
@@ -867,6 +876,8 @@ func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
 		res.Err = errNodeOffline
 		return
 	}
+	start := time.Now()
+
 	opts := o.RemoveObjectOptions
 	err := node.client.RemoveObject(ctx, o.Bucket, o.Object, opts)
 	return testResult{
@@ -880,7 +891,7 @@ func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
 }
 
 func (n *nodeState) cleanup() {
-	if n.numFailed > 0 {
+	if n.metrics.numFailed > 0 {
 		return
 	}
 	bucket := n.cliCtx.String("bucket")
@@ -906,10 +917,9 @@ func (n *nodeState) cleanup() {
 }
 
 func (n *nodeState) list(ctx context.Context, numEntries int, o listOpts) (res testResult) {
-	start := time.Now()
 	path := fmt.Sprintf("%s/%s", o.Bucket, o.Prefix)
 	res = testResult{
-		Method:   "LIST",
+		Method:   ListType,
 		Path:     path,
 		Node:     n.nodes[o.NodeIdx].endpointURL,
 		FuncName: "ListObjects",
@@ -920,6 +930,8 @@ func (n *nodeState) list(ctx context.Context, numEntries int, o listOpts) (res t
 		res.Err = errNodeOffline
 		return
 	}
+	start := time.Now()
+
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 	saw := 0
@@ -939,7 +951,7 @@ func (n *nodeState) list(ctx context.Context, numEntries int, o listOpts) (res t
 		res.Err = fmt.Errorf("mismatch in number of versions: expected %d , saw %d for %s", numEntries, saw, path)
 	}
 	return testResult{
-		Method:   "LIST",
+		Method:   ListType,
 		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Prefix),
 		FuncName: "ListObjects",
 		Err:      nil,

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb"
+	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/pkg/console"
 )
@@ -168,6 +169,10 @@ func getRevision() string {
 
 func confessMain(ctx *cli.Context) {
 	checkMain(ctx)
+	console.SetColor("metrics-duration", color.New(color.FgHiWhite))
+	console.SetColor("metrics-title", color.New(color.FgCyan))
+	console.SetColor("metrics-zero", color.New(color.FgHiWhite))
+
 	rand.Seed(time.Now().UnixNano())
 	nodeState := newNodeState(ctx)
 	nodeState.init(globalContext)

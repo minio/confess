@@ -28,8 +28,7 @@ var (
 			BorderForeground(lipgloss.Color("240"))
 
 	whiteStyle = lipgloss.NewStyle().
-			Bold(true).
-			AlignHorizontal(lipgloss.Left).
+			Bold(false).
 			Foreground(lipgloss.Color("#ffffff"))
 	subtle    = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
 	warnColor = lipgloss.AdaptiveColor{Light: "#bf4364", Dark: "#e31441"}

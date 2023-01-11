@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -35,6 +36,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
 	"github.com/minio/pkg/ellipses"
+	"github.com/olekukonko/tablewriter"
 )
 
 // node represents an endpoint to S3 object store
@@ -43,6 +45,53 @@ type node struct {
 	client      *minio.Client
 }
 
+// TestStats
+type TestStats struct {
+	TotalTests        uint64 `json:"totalTests"`
+	TotalBytesWritten uint64 `json:"totalBytes"`
+	//	TotalDuration     time.Duration `json:"totDuration"`
+	LatencyCumulative time.Duration `json:"latencycumulative"`
+	PeakLatency       time.Duration `json:"peakLatency"`
+	Throughput        uint64        `json:"throughput"`
+}
+
+func (s TestStats) ThroughputPerSec() uint64 {
+	if s.LatencyCumulative == 0 {
+		return 0
+	}
+	return s.TotalBytesWritten / uint64(s.LatencyCumulative.Seconds())
+}
+func (s TestStats) AvgLatency() time.Duration {
+	if s.TotalTests == 0 {
+		return 0
+	}
+	return s.LatencyCumulative / time.Duration(s.TotalTests)
+}
+func metricsDuration(d time.Duration) string {
+	if d == 0 {
+		return console.Colorize("metrics-zero", "0ms")
+	}
+	if d > time.Millisecond {
+		d = d.Round(time.Microsecond)
+	}
+	if d > time.Second {
+		d = d.Round(time.Millisecond)
+	}
+	if d > time.Minute {
+		d = d.Round(time.Second / 10)
+	}
+	return console.Colorize("metrics-duration", d)
+}
+
+type TestMetrics struct {
+	startTime time.Time
+	numTests  int32
+	numFailed int32
+	PutStats  TestStats
+	GetStats  TestStats
+	HeadStats TestStats
+	ListStats TestStats
+}
 type nodeState struct {
 	Prefixes    []string
 	nodes       []*node
@@ -57,11 +106,8 @@ type nodeState struct {
 	offlineMap map[string]bool
 
 	// stats
-	startTime time.Time
-	numTests  int32
-	numFailed int32
-
-	wg sync.WaitGroup
+	metrics TestMetrics
+	wg      sync.WaitGroup
 }
 
 func newNodeState(ctx *cli.Context) *nodeState {
@@ -128,7 +174,7 @@ func newNodeState(ctx *cli.Context) *nodeState {
 		pfxes = append(pfxes, fmt.Sprintf("confess/pfx%d", i))
 	}
 	return &nodeState{
-		startTime:  time.Now(),
+		metrics:    TestMetrics{startTime: time.Now()},
 		offlineMap: make(map[string]bool),
 		nodes:      nodes,
 		hc:         newHealthChecker(ctx, hcMap),
@@ -239,7 +285,7 @@ func (n *nodeState) init(ctx context.Context) {
 				fwriter.Flush()
 				f.Close()
 				n.cleanup() // finish clean up
-				console.Println(n.statusBar())
+				n.printSummary()
 				n.doneCh <- struct{}{}
 				return
 			case res, ok := <-n.resCh:
@@ -262,13 +308,13 @@ func (n *nodeState) init(ctx context.Context) {
 					}
 				}
 
-				totsuccess := atomic.LoadInt32(&n.numTests) - atomic.LoadInt32(&n.numFailed)
+				totsuccess := atomic.LoadInt32(&n.metrics.numTests) - atomic.LoadInt32(&n.metrics.numFailed)
 				if !errors.Is(res.Err, errNodeOffline) {
 					// summarize the stats here
-					atomic.AddInt32(&n.numTests, 1)
+					atomic.AddInt32(&n.metrics.numTests, 1)
 					if res.Err != nil {
 						if !res.RetryRequest {
-							atomic.AddInt32(&n.numFailed, 1)
+							atomic.AddInt32(&n.metrics.numFailed, 1)
 						}
 					} else {
 						totsuccess++
@@ -282,6 +328,8 @@ func (n *nodeState) init(ctx context.Context) {
 						} else {
 							eraseOnce = printWithErase(eraseOnce, n.printRow(res))
 						}
+					} else {
+						n.updateMetrics(ctx, res)
 					}
 					select { // fix status bar flicker
 					case <-ticker.C:
@@ -295,6 +343,98 @@ func (n *nodeState) init(ctx context.Context) {
 			}
 		}
 	}()
+}
+func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
+	switch res.Method {
+	case http.MethodHead:
+		n.metrics.HeadStats.TotalTests++
+		n.metrics.HeadStats.TotalBytesWritten += uint64(res.data.Size)
+		n.metrics.HeadStats.Throughput += uint64(res.data.Size)
+		n.metrics.HeadStats.LatencyCumulative += res.Latency
+		if n.metrics.HeadStats.PeakLatency < res.Latency {
+			n.metrics.HeadStats.PeakLatency = res.Latency
+		}
+	case http.MethodGet:
+		n.metrics.GetStats.TotalTests++
+		n.metrics.GetStats.TotalBytesWritten += uint64(res.data.Size)
+		n.metrics.GetStats.Throughput += uint64(res.data.Size)
+		n.metrics.GetStats.LatencyCumulative += res.Latency
+		if n.metrics.GetStats.PeakLatency < res.Latency {
+			n.metrics.GetStats.PeakLatency = res.Latency
+		}
+	case http.MethodPut, MultipartType:
+		n.metrics.PutStats.TotalTests++
+		n.metrics.PutStats.TotalBytesWritten += uint64(res.data.Size)
+		n.metrics.PutStats.Throughput += uint64(res.data.Size)
+		n.metrics.PutStats.LatencyCumulative += res.Latency
+		if n.metrics.PutStats.PeakLatency < res.Latency {
+			n.metrics.PutStats.PeakLatency = res.Latency
+		}
+
+	case ListType:
+		n.metrics.ListStats.TotalTests++
+		n.metrics.ListStats.TotalBytesWritten += uint64(res.data.Size)
+		n.metrics.ListStats.Throughput += uint64(res.data.Size)
+		n.metrics.ListStats.LatencyCumulative += res.Latency
+		if n.metrics.ListStats.PeakLatency < res.Latency {
+			n.metrics.ListStats.PeakLatency = res.Latency
+		}
+	}
+}
+
+func (n *nodeState) printSummary() {
+	var s strings.Builder
+
+	table := tablewriter.NewWriter(&s)
+	table.SetAutoWrapText(false)
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetBorder(true)
+	table.SetRowLine(false)
+	addRow := func(s string) {
+		table.Append([]string{s})
+	}
+	title := metricsTitle
+	_ = addRow
+	addRowF := func(format string, vals ...interface{}) {
+		s := fmt.Sprintf(format, vals...)
+		table.Append([]string{s})
+	}
+	uiSuccessStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("118")).
+		Bold(true)
+	uiFailedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("190")).
+		Bold(true)
+	success := uiSuccessStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numTests)-atomic.LoadInt32(&n.metrics.numFailed)))
+	failures := uiFailedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numFailed)))
+
+	addRowF(title("Total Operations succeeded:")+"   %s;"+title(" Total failed ")+" %s in %s", success, failures, humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
+	addRow("-------------------------------------- Confess Run Statistics -------------------------------------------")
+	addRowF(title("PUT: ") + fmt.Sprintf(" Throughput: %s/s  Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
+		whiteStyle.Render(humanize.IBytes(n.metrics.PutStats.ThroughputPerSec())),
+		whiteStyle.Render(metricsDuration(n.metrics.PutStats.AvgLatency())),
+		whiteStyle.Render(metricsDuration(n.metrics.PutStats.PeakLatency)),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.PutStats.TotalTests)))))
+	addRowF(title("GET: ") + fmt.Sprintf(" Throughput: %s/s  Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
+		whiteStyle.Render(humanize.IBytes(n.metrics.GetStats.ThroughputPerSec())),
+		whiteStyle.Render(metricsDuration(n.metrics.GetStats.AvgLatency())),
+		whiteStyle.Render(metricsDuration(n.metrics.GetStats.PeakLatency)),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalTests)))))
+	addRowF(title("HEAD:") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
+		whiteStyle.Render(metricsDuration(n.metrics.HeadStats.AvgLatency())),
+		whiteStyle.Render(metricsDuration(n.metrics.HeadStats.PeakLatency)),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalTests)))))
+	addRowF(title("LIST:") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
+		whiteStyle.Render(metricsDuration(n.metrics.ListStats.AvgLatency())),
+		whiteStyle.Render(metricsDuration(n.metrics.ListStats.PeakLatency)),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalTests)))))
+
+	table.Render()
+	console.Println(s.String())
+}
+func metricsTitle(s string) string {
+	return console.Colorize("metrics-title", s)
 }
 
 // wait on workers to finish
@@ -374,18 +514,18 @@ exitfor:
 
 // return summary for logfile
 func (n *nodeState) summaryMsg() string {
-	success := atomic.LoadInt32(&n.numTests) - atomic.LoadInt32(&n.numFailed)
-	return fmt.Sprintf("Operations succeeded=%d Operations Failed=%d Duration=%s\n", success, atomic.LoadInt32(&n.numFailed), humanize.RelTime(n.startTime, time.Now(), "", ""))
+	success := atomic.LoadInt32(&n.metrics.numTests) - atomic.LoadInt32(&n.metrics.numFailed)
+	return fmt.Sprintf("Operations succeeded=%d Operations Failed=%d Duration=%s\n", success, atomic.LoadInt32(&n.metrics.numFailed), humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 }
 
 func (n *nodeState) statusBar() string {
 	width := 96
 	statusKey := statusStyle.Render("STATUS")
-	success := successStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.numTests)-atomic.LoadInt32(&n.numFailed)))
-	failures := failedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.numFailed)))
+	success := successStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numTests)-atomic.LoadInt32(&n.metrics.numFailed)))
+	failures := failedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numFailed)))
 	bar := statusKey + statusTextStyle.Render("  Operations succeeded=") + success +
 		statusTextStyle.Render("Operations Failed=") + failures +
-		statusTextStyle.Render("Duration= "+humanize.RelTime(n.startTime, time.Now(), "", ""))
+		statusTextStyle.Render("Duration= "+humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 	return statusBarStyle.Width(width).Render(bar)
 }
 
