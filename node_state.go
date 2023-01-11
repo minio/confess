@@ -244,9 +244,9 @@ func (s statusChg) String() string {
 func (s statusChg) Render() string {
 	switch s.status {
 	case "online":
-		return divider + baseStyle.Render(s.epURL.Host) + " is " + advisory("online") + "\n"
+		return baseStyle.Render(s.epURL.Host) + " is " + advisory("online") + "\n"
 	case "offline":
-		return divider + baseStyle.Render(s.epURL.Host) + " is " + warn("offline") + "\n"
+		return baseStyle.Render(s.epURL.Host) + " is " + warn("offline") + "\n"
 	default:
 		return ""
 	}
@@ -327,21 +327,22 @@ func (n *nodeState) init(ctx context.Context) {
 							row := lipgloss.JoinHorizontal(lipgloss.Left, block)
 							eraseOnce = printWithErase(eraseOnce, row)
 							n.printHeader = false
-						} else {
+						} else if !res.RetryRequest {
 							eraseOnce = printWithErase(eraseOnce, n.printRow(res))
 						}
 					} else {
 						n.updateMetrics(ctx, res)
 					}
-					select { // fix status bar flicker
-					case <-ticker.C:
+				}
+				select { // fix status bar flicker
+				case <-ticker.C:
+					printWithErase(eraseOnce, n.statusBar())
+				default:
+					if eraseOnce {
 						printWithErase(eraseOnce, n.statusBar())
-					default:
-						if eraseOnce {
-							printWithErase(eraseOnce, n.statusBar())
-						}
 					}
 				}
+				//}
 			}
 		}
 	}()

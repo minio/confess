@@ -24,9 +24,9 @@ import (
 
 var (
 	baseStyle = lipgloss.NewStyle().
-			Align(lipgloss.Left).
-			BorderForeground(lipgloss.Color("240"))
-
+			Foreground(lipgloss.Color("14")).
+			Background(lipgloss.Color("0")).
+			Bold(false).Width(15)
 	whiteStyle = lipgloss.NewStyle().
 			Bold(false).
 			Foreground(lipgloss.Color("#ffffff"))
