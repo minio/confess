@@ -125,8 +125,8 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
-     $ confess --access-key minio --secret-key minio123 http://minio{1...4}:9000
+  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on "mybucket"
+     $ confess --access-key minio --secret-key minio123 --bucket "mybucket" http://minio{1...4}:9000
 `
 	app.Action = confessMain
 	app.Run(os.Args)
