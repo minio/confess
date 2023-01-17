@@ -52,15 +52,6 @@ type TestStats struct {
 	//	TotalDuration     time.Duration `json:"totDuration"`
 	LatencyCumulative time.Duration `json:"latencycumulative"`
 	PeakLatency       time.Duration `json:"peakLatency"`
-	Throughput        uint64        `json:"throughput"`
-}
-
-func (s TestStats) ThroughputPerSec() uint64 {
-	duration := uint64(s.LatencyCumulative.Seconds())
-	if duration == 0 {
-		return 0
-	}
-	return s.TotalBytesWritten / duration
 }
 
 func (s TestStats) AvgLatency() time.Duration {
@@ -352,7 +343,6 @@ func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
 	case http.MethodHead:
 		n.metrics.HeadStats.TotalTests++
 		n.metrics.HeadStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.HeadStats.Throughput += uint64(res.data.Size)
 		n.metrics.HeadStats.LatencyCumulative += res.Latency
 		if n.metrics.HeadStats.PeakLatency < res.Latency {
 			n.metrics.HeadStats.PeakLatency = res.Latency
@@ -360,7 +350,6 @@ func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
 	case http.MethodGet:
 		n.metrics.GetStats.TotalTests++
 		n.metrics.GetStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.GetStats.Throughput += uint64(res.data.Size)
 		n.metrics.GetStats.LatencyCumulative += res.Latency
 		if n.metrics.GetStats.PeakLatency < res.Latency {
 			n.metrics.GetStats.PeakLatency = res.Latency
@@ -368,7 +357,6 @@ func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
 	case http.MethodPut, MultipartType:
 		n.metrics.PutStats.TotalTests++
 		n.metrics.PutStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.PutStats.Throughput += uint64(res.data.Size)
 		n.metrics.PutStats.LatencyCumulative += res.Latency
 		if n.metrics.PutStats.PeakLatency < res.Latency {
 			n.metrics.PutStats.PeakLatency = res.Latency
@@ -377,7 +365,6 @@ func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
 	case ListType:
 		n.metrics.ListStats.TotalTests++
 		n.metrics.ListStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.ListStats.Throughput += uint64(res.data.Size)
 		n.metrics.ListStats.LatencyCumulative += res.Latency
 		if n.metrics.ListStats.PeakLatency < res.Latency {
 			n.metrics.ListStats.PeakLatency = res.Latency
@@ -414,13 +401,11 @@ func (n *nodeState) printSummary() {
 
 	addRowF(title("Total Operations succeeded:")+"   %s;"+title(" Total failed ")+" %s in %s", success, failures, humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 	addRow("-------------------------------------- Confess Run Statistics -------------------------------------------")
-	addRowF(title("PUT: ") + fmt.Sprintf(" Throughput: %s/s  Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(humanize.IBytes(n.metrics.PutStats.ThroughputPerSec())),
+	addRowF(title("PUT: ") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
 		whiteStyle.Render(metricsDuration(n.metrics.PutStats.AvgLatency())),
 		whiteStyle.Render(metricsDuration(n.metrics.PutStats.PeakLatency)),
 		whiteStyle.Render(humanize.Comma(int64(n.metrics.PutStats.TotalTests)))))
-	addRowF(title("GET: ") + fmt.Sprintf(" Throughput: %s/s  Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(humanize.IBytes(n.metrics.GetStats.ThroughputPerSec())),
+	addRowF(title("GET: ") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
 		whiteStyle.Render(metricsDuration(n.metrics.GetStats.AvgLatency())),
 		whiteStyle.Render(metricsDuration(n.metrics.GetStats.PeakLatency)),
 		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalTests)))))
