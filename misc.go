@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
 	"github.com/minio/console/pkg"
 	md5simd "github.com/minio/md5-simd"
@@ -66,7 +67,7 @@ func clientTransport(ctx *cli.Context, enableTLS bool) *http.Transport {
 		// Keep TLS config.
 		tr.TLSClientConfig = &tls.Config{
 			RootCAs:            mustGetSystemCertPool(),
-			InsecureSkipVerify: ctx.GlobalBool("insecure"),
+			InsecureSkipVerify: ctx.Bool("insecure"),
 			// Can't use SSLv3 because of POODLE and BEAST
 			// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
 			// Can't use TLSv1.1 because of RC4 cipher usage
@@ -124,4 +125,11 @@ func newRandomReader(seed, size int64) io.Reader {
 // read data from file if it exists or optionally create a buffer of particular size
 func getDataReader(size int64) io.ReadCloser {
 	return ioutil.NopCloser(newRandomReader(size, size))
+}
+
+func getMultipartObjsize(n int) int {
+	if n == 1 {
+		return humanize.MiByte * 5
+	}
+	return (n-1)*humanize.MiByte*5 + 1
 }

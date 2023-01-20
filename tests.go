@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -40,14 +41,17 @@ const (
 type Op struct {
 	minio.ObjectInfo
 	Type          string
+	TestName      string
 	Prefix        string
 	ExpectedCount int // for listing
 	NodeIdx       int // node at which to run operation
 }
 
 type RetryInfo struct {
-	OK      bool // retries GET|HEAD|LIST operation
-	ObjInfo minio.ObjectInfo
+	OK       bool // retries GET|HEAD|LIST operation
+	ObjInfo  minio.ObjectInfo
+	Err      error
+	TestName string
 }
 type OpSequence struct {
 	Test  func(ctx context.Context, r RetryInfo)
@@ -55,15 +59,16 @@ type OpSequence struct {
 }
 
 type testResult struct {
-	Method       string        `json:"method"`
-	FuncName     string        `json:"funcName"`
-	Path         string        `json:"path"`
-	Node         *url.URL      `json:"node"`
-	Err          error         `json:"err,omitempty"`
-	Latency      time.Duration `json:"duration"`
-	Offline      bool          `json:"offline"`
-	RetryRequest bool          `json:"retry"`
-	TestFn       func(context.Context)
+	Method       string           `json:"method"`
+	FuncName     string           `json:"funcName"`
+	Path         string           `json:"path"`
+	Node         *url.URL         `json:"node"`
+	Err          error            `json:"err,omitempty"`
+	Latency      time.Duration    `json:"duration"`
+	Offline      bool             `json:"offline"`
+	RetryRequest bool             `json:"retry"`
+	AbortTest    bool             `json:"abortTest"`
+	TestName     string           `json:"testName"`
 	data         minio.ObjectInfo `json:"-"`
 	StartTime    time.Time        `json:"startTime"`
 	EndTime      time.Time        `json:"endTime"`
@@ -74,7 +79,7 @@ func (r *testResult) String() string {
 	if r.Err != nil {
 		errMsg = r.Err.Error()
 	}
-	return fmt.Sprintf("%s %s %s: %s %s %s %s", r.StartTime.Format(time.RFC3339Nano), r.EndTime.Format(time.RFC3339Nano), r.Node, r.Path, r.Method, r.FuncName, errMsg)
+	return fmt.Sprintf("%s %s %s: %s %s %s %s %s", r.StartTime.Format(time.RFC3339Nano), r.EndTime.Format(time.RFC3339Nano), r.Node, r.TestName, r.Path, r.Method, r.FuncName, errMsg)
 }
 
 var (
@@ -82,10 +87,11 @@ var (
 )
 
 // prints line to console - erase status bar if erased is true
-func printWithErase(erased bool, msg string) bool {
+func (n *nodeState) printWithErase(erased bool, msg string) bool {
 	if !erased {
 		console.Eraseline()
 	}
+
 	console.Print(msg + "\r")
 	return true
 }
@@ -104,17 +110,17 @@ func (n *nodeState) generateTest() (seq OpSequence) {
 	tIdx := rand.Intn(6)
 	switch tIdx {
 	case 0:
-		seq.Test = n.testHeadWithVersion
+		seq.Test = n.TestHeadVersionConsistency
 	case 1:
-		seq.Test = n.testGetWithVersion
+		seq.Test = n.TestGetVersionConsistency
 	case 2:
-		seq.Test = n.testListObject
+		seq.Test = n.TestListConsistency
 	case 3:
-		seq.Test = n.testHeadAfterMultipartUpload
+		seq.Test = n.TestHeadVersionConsistencyMultipartObject
 	case 4:
-		seq.Test = n.testGetAfterMultipartUpload
+		seq.Test = n.TestGetVersionConsistencyMultipartObject
 	case 5:
-		seq.Test = n.testListAfterMultipartUpload
+		seq.Test = n.TestListConsistencyMultipartUpload
 	}
 	return
 }
@@ -139,10 +145,11 @@ func (n *nodeState) genObjName() string {
 	pfx := n.getRandomPfx()
 	return fmt.Sprintf("%s/%s", pfx, shortuuid.New())
 }
-func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
-
+func (n *nodeState) TestGetVersionConsistency(ctx context.Context, retry RetryInfo) {
+	testName := "TestGetVersionConsistency"
 	op := Op{
-		Type: http.MethodPut,
+		Type:     http.MethodPut,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: 4 * humanize.KiByte,
@@ -161,15 +168,14 @@ func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
 	var requeue bool
 
 	if res.Err == nil {
-		op := Op{
-			Type: http.MethodGet,
-			ObjectInfo: minio.ObjectInfo{
-				Key:       res.data.Key,
-				VersionID: res.data.VersionID,
-				ETag:      res.data.ETag,
-				Size:      res.data.Size,
-			},
+		op.Type = http.MethodGet
+		op.ObjectInfo = minio.ObjectInfo{
+			Key:       res.data.Key,
+			VersionID: res.data.VersionID,
+			ETag:      res.data.ETag,
+			Size:      res.data.Size,
 		}
+
 		var wg sync.WaitGroup
 		for i := 0; i < len(n.nodes); i++ {
 			wg.Add(1)
@@ -184,8 +190,8 @@ func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
 				}
 				if gres.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testGetWithVersion,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestGetVersionConsistency,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: gres.Err, TestName: gres.TestName},
 					})
 					requeue = true
 				}
@@ -204,10 +210,13 @@ func (n *nodeState) testGetWithVersion(ctx context.Context, retry RetryInfo) {
 	}
 }
 
-func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
-	mpartSize := len(n.nodes) * humanize.MiByte * 5
+func (n *nodeState) TestGetVersionConsistencyMultipartObject(ctx context.Context, retry RetryInfo) {
+	testName := "TestGetVersionConsistencyMultipartObject"
+	mpartSize := getMultipartObjsize(len(n.nodes))
+
 	op := Op{
-		Type: MultipartType,
+		Type:     MultipartType,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -225,14 +234,12 @@ func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry Retry
 	}
 	var requeue bool
 	if res.Err == nil && res.FuncName == "CompleteMultipartUpload" {
-		op := Op{
-			Type: http.MethodGet,
-			ObjectInfo: minio.ObjectInfo{
-				Key:       res.data.Key,
-				VersionID: res.data.VersionID,
-				ETag:      res.data.ETag,
-				Size:      res.data.Size,
-			},
+		op.Type = http.MethodGet
+		op.ObjectInfo = minio.ObjectInfo{
+			Key:       res.data.Key,
+			VersionID: res.data.VersionID,
+			ETag:      res.data.ETag,
+			Size:      res.data.Size,
 		}
 		var wg sync.WaitGroup
 		for i := 0; i < len(n.nodes); i++ {
@@ -248,8 +255,8 @@ func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry Retry
 				}
 				if res2.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testGetAfterMultipartUpload,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestGetVersionConsistencyMultipartObject,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: res2.Err, TestName: res2.TestName},
 					})
 					requeue = true
 				}
@@ -268,9 +275,12 @@ func (n *nodeState) testGetAfterMultipartUpload(ctx context.Context, retry Retry
 	}
 }
 
-func (n *nodeState) testHeadWithVersion(ctx context.Context, retry RetryInfo) {
+func (n *nodeState) TestHeadVersionConsistency(ctx context.Context, retry RetryInfo) {
+	testName := "TestHeadVersionConsistency"
+
 	op := Op{
-		Type: http.MethodPut,
+		Type:     http.MethodPut,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: 4 * humanize.KiByte,
@@ -311,8 +321,8 @@ func (n *nodeState) testHeadWithVersion(ctx context.Context, retry RetryInfo) {
 				}
 				if res2.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testHeadWithVersion,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestHeadVersionConsistency,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: res2.Err, TestName: res2.TestName},
 					})
 					requeue = true
 				}
@@ -331,10 +341,14 @@ func (n *nodeState) testHeadWithVersion(ctx context.Context, retry RetryInfo) {
 	}
 }
 
-func (n *nodeState) testHeadAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
-	mpartSize := len(n.nodes) * humanize.MiByte * 5
+func (n *nodeState) TestHeadVersionConsistencyMultipartObject(ctx context.Context, retry RetryInfo) {
+	testName := "TestHeadVersionConsistencyMultipartObject"
+
+	mpartSize := getMultipartObjsize(len(n.nodes))
+
 	op := Op{
-		Type: MultipartType,
+		Type:     MultipartType,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -380,8 +394,8 @@ func (n *nodeState) testHeadAfterMultipartUpload(ctx context.Context, retry Retr
 				}
 				if res2.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testHeadAfterMultipartUpload,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestHeadVersionConsistencyMultipartObject,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: res2.Err, TestName: res2.TestName},
 					})
 					requeue = true
 				}
@@ -400,11 +414,14 @@ func (n *nodeState) testHeadAfterMultipartUpload(ctx context.Context, retry Retr
 	}
 }
 
-func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
+func (n *nodeState) TestListConsistency(ctx context.Context, retry RetryInfo) {
+	testName := "TestListConsistency"
+
 	count := 0
 	object := n.genObjName()
 	op := Op{
-		Type: http.MethodPut,
+		Type:     http.MethodPut,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  object,
 			Size: 4 * humanize.KiByte,
@@ -450,8 +467,8 @@ func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
 				}
 				if res2.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testListObject,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestListConsistency,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: res2.Err, TestName: res2.TestName},
 					})
 					requeue = true
 				}
@@ -471,10 +488,13 @@ func (n *nodeState) testListObject(ctx context.Context, retry RetryInfo) {
 		}
 	}
 }
-func (n *nodeState) testListAfterMultipartUpload(ctx context.Context, retry RetryInfo) {
-	mpartSize := len(n.nodes) * humanize.MiByte * 5
+func (n *nodeState) TestListConsistencyMultipartUpload(ctx context.Context, retry RetryInfo) {
+	testName := "TestListConsistencyMultipartUpload"
+	mpartSize := getMultipartObjsize(len(n.nodes))
+
 	op := Op{
-		Type: MultipartType,
+		Type:     MultipartType,
+		TestName: testName,
 		ObjectInfo: minio.ObjectInfo{
 			Key:  n.genObjName(),
 			Size: int64(mpartSize),
@@ -521,8 +541,8 @@ func (n *nodeState) testListAfterMultipartUpload(ctx context.Context, retry Retr
 				}
 				if res2.RetryRequest {
 					go n.queueTest(ctx, OpSequence{
-						Test:  n.testListAfterMultipartUpload,
-						Retry: RetryInfo{OK: true, ObjInfo: res.data},
+						Test:  n.TestListConsistencyMultipartUpload,
+						Retry: RetryInfo{OK: true, ObjInfo: res.data, Err: res2.Err, TestName: res2.TestName},
 					})
 					requeue = true
 				}
@@ -549,6 +569,7 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 
 	if n.hc.isOffline(node.endpointURL) {
 		res = testResult{
+			TestName:  op.TestName,
 			Offline:   true,
 			Err:       errNodeOffline,
 			Node:      node.endpointURL,
@@ -558,9 +579,10 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 		return
 	}
 	defer func() {
+		res.TestName = op.TestName
 		res.StartTime = startTime
 		res.EndTime = time.Now().UTC()
-		if res.Err == nil {
+		if res.Err == nil || errors.Is(res.Err, context.Canceled) {
 			return
 		}
 		errResp := minio.ToErrorResponse(res.Err)
@@ -686,13 +708,14 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 
 	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), o.PutObjectOptions)
 	return testResult{
-		Method:   http.MethodPut,
-		Path:     fmt.Sprintf("%s/%s", o.Bucket, o.Object),
-		FuncName: "PutObject",
-		Err:      err,
-		Node:     n.nodes[o.NodeIdx].endpointURL,
-		Latency:  time.Since(start),
-		data:     toObjectInfo(oi),
+		Method:    http.MethodPut,
+		Path:      fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		FuncName:  "PutObject",
+		Err:       err,
+		AbortTest: err != nil,
+		Node:      n.nodes[o.NodeIdx].endpointURL,
+		Latency:   time.Since(start),
+		data:      toObjectInfo(oi),
 	}
 }
 
@@ -723,10 +746,10 @@ func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult
 
 	defer func() {
 		if err != nil {
-			aerr := c.AbortMultipartUpload(ctx, o.Bucket, o.Object, uploadID)
-			res.Err = aerr
+			c.AbortMultipartUpload(ctx, o.Bucket, o.Object, uploadID)
 			res.FuncName = "AbortMultipartUpload"
 			res.Method = http.MethodPost
+			res.AbortTest = true
 			return
 		}
 	}()
@@ -742,9 +765,8 @@ func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult
 		var (
 			pInfo minio.ObjectPart
 		)
-		mpartSize -= int64(partSize)
-		if i == len(n.nodes) && mpartSize > 0 {
-			partSize += int64(mpartSize)
+		if i == (len(n.nodes)-1) && mpartSize > 0 {
+			partSize = int64(mpartSize)
 		}
 		reader := getDataReader(partSize)
 		defer reader.Close()
@@ -759,6 +781,8 @@ func (n *nodeState) multipartPut(ctx context.Context, o putOpts) (res testResult
 			res.Err = err
 			return
 		}
+		mpartSize -= int64(partSize)
+
 		uploadedParts = append(uploadedParts, minio.CompletePart{
 			PartNumber: pInfo.PartNumber,
 			ETag:       pInfo.ETag,
@@ -842,7 +866,7 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 		if oi.ETag != o.ObjInfo.ETag ||
 			(oi.VersionID != o.ObjInfo.VersionID && o.ObjInfo.VersionID != "") ||
 			oi.Size != o.ObjInfo.Size {
-			err = fmt.Errorf("metadata mismatch: %s, %s, %s,%s, %d, %d", oi.ETag, o.ObjInfo.ETag, oi.VersionID, o.ObjInfo.VersionID, oi.Size, o.Size)
+			err = fmt.Errorf("metadata mismatch: ETag(expected: %s, actual:%s),Version (expected: %s,actual: %s), Size:(expected: %d, actual:%d)", o.ObjInfo.ETag, oi.ETag, o.ObjInfo.VersionID, oi.VersionID, o.Size, oi.Size)
 		}
 	}
 	if err == nil && len(o.ObjInfo.UserMetadata) > 0 {

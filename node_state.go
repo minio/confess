@@ -30,6 +30,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
@@ -37,6 +39,8 @@ import (
 	"github.com/minio/pkg/console"
 	"github.com/minio/pkg/ellipses"
 	"github.com/olekukonko/tablewriter"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // node represents an endpoint to S3 object store
@@ -47,9 +51,9 @@ type node struct {
 
 // TestStats
 type TestStats struct {
-	TotalTests        uint64 `json:"totalTests"`
-	TotalBytesWritten uint64 `json:"totalBytes"`
-	//	TotalDuration     time.Duration `json:"totDuration"`
+	TotalTests        uint64        `json:"totalTests"`
+	TotalFailures     uint64        `json:"totalFailures"`
+	TotalBytesWritten uint64        `json:"totalBytes"`
 	LatencyCumulative time.Duration `json:"latencycumulative"`
 	PeakLatency       time.Duration `json:"peakLatency"`
 }
@@ -59,21 +63,6 @@ func (s TestStats) AvgLatency() time.Duration {
 		return 0
 	}
 	return s.LatencyCumulative / time.Duration(s.TotalTests)
-}
-func metricsDuration(d time.Duration) string {
-	if d == 0 {
-		return console.Colorize("metrics-zero", "0ms")
-	}
-	if d > time.Millisecond {
-		d = d.Round(time.Microsecond)
-	}
-	if d > time.Second {
-		d = d.Round(time.Millisecond)
-	}
-	if d > time.Minute {
-		d = d.Round(time.Second / 10)
-	}
-	return console.Colorize("metrics-duration", d)
 }
 
 type TestMetrics struct {
@@ -86,19 +75,19 @@ type TestMetrics struct {
 	ListStats TestStats
 }
 type nodeState struct {
-	Prefixes    []string
-	nodes       []*node
-	hc          *healthChecker
-	cliCtx      *cli.Context
-	resCh       chan testResult
-	testCh      chan OpSequence
-	doneCh      chan struct{}
-	printHeader bool
+	Prefixes []string
+	nodes    []*node
+	hc       *healthChecker
+	cliCtx   *cli.Context
+	resCh    chan testResult
+	testCh   chan OpSequence
+	doneCh   chan struct{}
 	// track offline nodes
 	nlock      sync.RWMutex
 	offlineMap map[string]bool
 
 	// stats
+	model   model
 	metrics TestMetrics
 	wg      sync.WaitGroup
 }
@@ -106,8 +95,7 @@ type nodeState struct {
 func newNodeState(ctx *cli.Context) *nodeState {
 	var endpoints []string
 	var nodes []*node
-	//minio.MaxRetry = 1
-
+	now := time.Now()
 	for _, hostStr := range ctx.Args() {
 		hosts := strings.Split(hostStr, ",")
 		for _, host := range hosts {
@@ -164,10 +152,10 @@ func newNodeState(ctx *cli.Context) *nodeState {
 	}
 	var pfxes []string
 	for i := 0; i < 10; i++ {
-		pfxes = append(pfxes, fmt.Sprintf("confess/pfx%d", i))
+		pfxes = append(pfxes, fmt.Sprintf("confess_%s/pfx%d", now.Format("01-02-2006-15-04-05"), i))
 	}
 	return &nodeState{
-		metrics:    TestMetrics{startTime: time.Now()},
+		metrics:    TestMetrics{startTime: now},
 		offlineMap: make(map[string]bool),
 		nodes:      nodes,
 		hc:         newHealthChecker(ctx, hcMap),
@@ -176,7 +164,29 @@ func newNodeState(ctx *cli.Context) *nodeState {
 		testCh:     make(chan OpSequence, 1000),
 		doneCh:     make(chan struct{}, 1),
 		Prefixes:   pfxes,
+		model:      initialModel(),
 	}
+}
+
+// disallow test on object locked bucket
+func (n *nodeState) checkBucket(bucket string) error {
+	for _, node := range n.nodes {
+		if n.hc.isOffline(node.endpointURL) {
+			continue
+		}
+		_, _, _, _, err := node.client.GetObjectLockConfig(context.Background(), bucket)
+		if err == nil {
+			return fmt.Errorf("%s is object lock enabled. Please use another bucket", bucket)
+		}
+		aerr := minio.ToErrorResponse(err)
+		switch aerr.Code {
+		case "NoSuchBucket":
+			return fmt.Errorf("bucket `%s` does not exist ", bucket)
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 func (n *nodeState) getRandomPfx() string {
@@ -193,6 +203,17 @@ func (n *nodeState) addWorker(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				for op := range n.testCh {
+					if op.Retry.OK {
+						n.resCh <- testResult{
+							Err:       op.Retry.Err,
+							Path:      fmt.Sprintf("%s/%s", n.cliCtx.String("bucket"), op.Retry.ObjInfo.Key),
+							TestName:  op.Retry.TestName,
+							StartTime: time.Now(),
+							EndTime:   time.Now(),
+						}
+					}
+				}
 				return
 			case ops, ok := <-n.testCh:
 				if !ok {
@@ -232,16 +253,6 @@ type statusChg struct {
 func (s statusChg) String() string {
 	return fmt.Sprintf("%s is %s", s.epURL.Host, s.status)
 }
-func (s statusChg) Render() string {
-	switch s.status {
-	case "online":
-		return baseStyle.Render(s.epURL.Host) + " is " + advisory("online") + "\n"
-	case "offline":
-		return baseStyle.Render(s.epURL.Host) + " is " + warn("offline") + "\n"
-	default:
-		return ""
-	}
-}
 
 // initialize clients, health check and tests...
 func (n *nodeState) init(ctx context.Context) {
@@ -251,14 +262,11 @@ func (n *nodeState) init(ctx context.Context) {
 	for i := 0; i < concurrency; i++ {
 		n.addWorker(ctx)
 	}
-	n.wg.Add(1)
 
-	n.printHeader = true
 	go func() {
-		defer n.wg.Done()
-		logFile := fmt.Sprintf("%s%s.txt", "confess", time.Now().Format(".01-02-2006-15-04-05"))
-		if n.cliCtx.IsSet("output") {
-			logFile = fmt.Sprintf("%s/%s", n.cliCtx.String("output"), logFile)
+		logFile := n.cliCtx.String("output")
+		if logFile == "" {
+			logFile = fmt.Sprintf("%s%s.txt", "confess", time.Now().Format(".01-02-2006-15-04-05"))
 		}
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
@@ -272,12 +280,28 @@ func (n *nodeState) init(ctx context.Context) {
 		for {
 			select {
 			case <-globalContext.Done():
+				p := tea.NewProgram(initialModel(), tea.WithoutSignalHandler())
+				go func() {
+					if _, err := p.Run(); err != nil {
+						os.Exit(1)
+					}
+				}()
+
+				for res := range n.resCh {
+					if res.Err != nil && !errors.Is(res.Err, context.Canceled) {
+						if _, err := f.WriteString(res.String() + "\n"); err != nil {
+							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+						}
+					}
+				}
+
 				if _, err := f.WriteString(n.summaryMsg()); err != nil {
 					console.Fatalf("unable to write summary to 'confess' log: %s\n", err)
 				}
 				fwriter.Flush()
 				f.Close()
 				n.cleanup() // finish clean up
+				n.model.quitting = true
 				n.printSummary()
 				n.doneCh <- struct{}{}
 				return
@@ -288,13 +312,13 @@ func (n *nodeState) init(ctx context.Context) {
 				eraseOnce := false
 				statusChg := n.hcStatus(res.Node)
 				if statusChg.status != "" {
-					eraseOnce = printWithErase(eraseOnce, statusChg.Render())
+					eraseOnce = n.printWithErase(eraseOnce, statusChg.Render())
 					if _, err := f.WriteString(fmt.Sprintf("%s %s %s\n", res.StartTime.Format(time.RFC3339Nano), res.EndTime.Format(time.RFC3339Nano), statusChg.String())); err != nil {
 						console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 					}
 				}
 				if res.Err != nil {
-					if !errors.Is(res.Err, errNodeOffline) && !res.RetryRequest {
+					if !errors.Is(res.Err, errNodeOffline) || !res.RetryRequest || !res.AbortTest {
 						if _, err := f.WriteString(res.String() + "\n"); err != nil {
 							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 						}
@@ -306,34 +330,25 @@ func (n *nodeState) init(ctx context.Context) {
 					// summarize the stats here
 					atomic.AddInt32(&n.metrics.numTests, 1)
 					if res.Err != nil {
-						if !res.RetryRequest {
+						if !res.RetryRequest && !res.AbortTest {
 							atomic.AddInt32(&n.metrics.numFailed, 1)
 						}
 					} else {
 						totsuccess++
 					}
-					if res.Err != nil {
-						if n.printHeader {
-							block := lipgloss.PlaceHorizontal(80, lipgloss.Center, "Consistency Errors"+divider)
-							row := lipgloss.JoinHorizontal(lipgloss.Left, block)
-							eraseOnce = printWithErase(eraseOnce, row)
-							n.printHeader = false
-						} else if !res.RetryRequest {
-							eraseOnce = printWithErase(eraseOnce, n.printRow(res))
-						}
-					} else {
-						n.updateMetrics(ctx, res)
+					if res.Err != nil && !res.RetryRequest && !res.AbortTest {
+						eraseOnce = n.printWithErase(eraseOnce, n.printRow(res))
 					}
+					n.updateMetrics(ctx, res)
 				}
 				select { // fix status bar flicker
 				case <-ticker.C:
-					printWithErase(eraseOnce, n.statusBar())
+					n.printWithErase(eraseOnce, n.statusBar())
 				default:
 					if eraseOnce {
-						printWithErase(eraseOnce, n.statusBar())
+						n.printWithErase(eraseOnce, n.statusBar())
 					}
 				}
-				//}
 			}
 		}
 	}()
@@ -342,32 +357,24 @@ func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
 	switch res.Method {
 	case http.MethodHead:
 		n.metrics.HeadStats.TotalTests++
-		n.metrics.HeadStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.HeadStats.LatencyCumulative += res.Latency
-		if n.metrics.HeadStats.PeakLatency < res.Latency {
-			n.metrics.HeadStats.PeakLatency = res.Latency
+		if res.Err != nil {
+			n.metrics.HeadStats.TotalFailures++
+		} else {
+			n.metrics.HeadStats.TotalBytesWritten += uint64(res.data.Size)
 		}
 	case http.MethodGet:
 		n.metrics.GetStats.TotalTests++
-		n.metrics.GetStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.GetStats.LatencyCumulative += res.Latency
-		if n.metrics.GetStats.PeakLatency < res.Latency {
-			n.metrics.GetStats.PeakLatency = res.Latency
+		if res.Err != nil {
+			n.metrics.GetStats.TotalFailures++
+		} else {
+			n.metrics.GetStats.TotalBytesWritten += uint64(res.data.Size)
 		}
-	case http.MethodPut, MultipartType:
-		n.metrics.PutStats.TotalTests++
-		n.metrics.PutStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.PutStats.LatencyCumulative += res.Latency
-		if n.metrics.PutStats.PeakLatency < res.Latency {
-			n.metrics.PutStats.PeakLatency = res.Latency
-		}
-
 	case ListType:
 		n.metrics.ListStats.TotalTests++
-		n.metrics.ListStats.TotalBytesWritten += uint64(res.data.Size)
-		n.metrics.ListStats.LatencyCumulative += res.Latency
-		if n.metrics.ListStats.PeakLatency < res.Latency {
-			n.metrics.ListStats.PeakLatency = res.Latency
+		if res.Err != nil {
+			n.metrics.ListStats.TotalFailures++
+		} else {
+			n.metrics.ListStats.TotalBytesWritten += uint64(res.data.Size)
 		}
 	}
 }
@@ -401,22 +408,15 @@ func (n *nodeState) printSummary() {
 
 	addRowF(title("Total Operations succeeded:")+"   %s;"+title(" Total failed ")+" %s in %s", success, failures, humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 	addRow("-------------------------------------- Confess Run Statistics -------------------------------------------")
-	addRowF(title("PUT: ") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(metricsDuration(n.metrics.PutStats.AvgLatency())),
-		whiteStyle.Render(metricsDuration(n.metrics.PutStats.PeakLatency)),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.PutStats.TotalTests)))))
-	addRowF(title("GET: ") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(metricsDuration(n.metrics.GetStats.AvgLatency())),
-		whiteStyle.Render(metricsDuration(n.metrics.GetStats.PeakLatency)),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalTests)))))
-	addRowF(title("HEAD:") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(metricsDuration(n.metrics.HeadStats.AvgLatency())),
-		whiteStyle.Render(metricsDuration(n.metrics.HeadStats.PeakLatency)),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalTests)))))
-	addRowF(title("LIST:") + fmt.Sprintf(" Avg.Latency: %s  Peak Latency: %s Total Operations: %s",
-		whiteStyle.Render(metricsDuration(n.metrics.ListStats.AvgLatency())),
-		whiteStyle.Render(metricsDuration(n.metrics.ListStats.PeakLatency)),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalTests)))))
+	addRowF(title("GET:  ") + fmt.Sprintf("  %s operations; %s failed",
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalTests))),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalFailures)))))
+	addRowF(title("HEAD: ") + fmt.Sprintf("  %s operations; %s failed",
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalTests))),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalFailures)))))
+	addRowF(title("LIST: ") + fmt.Sprintf("  %s operations; %s failed",
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalTests))),
+		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalFailures)))))
 
 	table.Render()
 	console.Println(s.String())
@@ -426,7 +426,7 @@ func metricsTitle(s string) string {
 }
 
 // wait on workers to finish
-func (n *nodeState) finish(ctx context.Context) {
+func (n *nodeState) finish() {
 	<-globalContext.Done()
 	n.wg.Wait()
 	close(n.resCh)
@@ -456,10 +456,14 @@ func (n *nodeState) trapSignals(sig ...os.Signal) {
 	// `signal.Notify` registers the given channel to
 	// receive notifications of the specified signals.
 	signal.Notify(sigCh, sig...)
+
 	var s os.Signal
 exitfor:
 	for {
 		select {
+		case s = <-sigCh:
+			signal.Stop(sigCh)
+			break exitfor
 		default:
 			var duration time.Duration
 			var timer *time.Timer
@@ -467,16 +471,16 @@ exitfor:
 				duration = n.cliCtx.Duration("duration")
 				timer = time.NewTimer(duration)
 				defer timer.Stop()
-				<-timer.C
+				select {
+				case <-timer.C:
+				case <-sigCh:
+					signal.Stop(sigCh)
+				}
 				break exitfor
 			}
 			// Wait for the signal.
-		case s = <-sigCh:
-			signal.Stop(sigCh)
-			break exitfor
 		}
 	}
-
 	// Cancel the global context - wait for cleanup and final summary to be printed to logfile and screen
 	globalCancel()
 	n.wg.Wait()
@@ -507,8 +511,8 @@ func (n *nodeState) summaryMsg() string {
 }
 
 func (n *nodeState) statusBar() string {
-	width := 96
-	statusKey := statusStyle.Render("STATUS")
+	width := 108
+	statusKey := statusStyle.Render(" STATUS")
 	success := successStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numTests)-atomic.LoadInt32(&n.metrics.numFailed)))
 	failures := failedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numFailed)))
 	bar := statusKey + statusTextStyle.Render("  Operations succeeded=") + success +
@@ -517,21 +521,63 @@ func (n *nodeState) statusBar() string {
 	return statusBarStyle.Width(width).Render(bar)
 }
 
-func (n *nodeState) maxNodeLen() int {
-	max := 0
-	for _, node := range n.nodes {
-		if max < len(node.endpointURL.Host) {
-			max = len(node.endpointURL.Host)
-		}
-	}
-	return max
-}
+var titleCase = cases.Title(language.English)
 
 func (n *nodeState) printRow(r testResult) string {
-	maxNodeLen := n.maxNodeLen()
-	cols := getColumns()
-	msg1 := fmt.Sprintf("%s %s %s",
-		cols[0].Style.Width(maxNodeLen).Render(r.Node.Host), cols[2].Style.Width(15).Render(r.FuncName), cols[1].Style.Width(48).Render(r.Path))
-	msg2 := cols[3].Style.Width(60).Render(lipgloss.JoinVertical(lipgloss.Left, strings.TrimSpace(r.Err.Error())))
-	return lipgloss.JoinHorizontal(lipgloss.Top, msg1, msg2)
+	errMsg := fmt.Sprintf(" %s failed %s consistency", r.Path, titleCase.String(r.Method))
+	columnA := "  " + nodeStyle.Render(r.Node.Host) + " | "
+	columnB := errMsgStyle.Width(80).Render(lipgloss.JoinVertical(lipgloss.Left, errMsg))
+	return bassStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, columnA, columnB))
+}
+
+func (s statusChg) Render() string {
+	columnB := ""
+	switch s.status {
+	case "online":
+		columnB = " is " + advisory("online")
+	case "offline":
+		columnB = " is " + warn("offline")
+	default:
+		return ""
+	}
+	columnA := "  " + nodeStyle.Render(s.epURL.Host) + " | "
+	return bassStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, columnA, columnB))
+
+}
+
+type model struct {
+	spinner  spinner.Model
+	quitting bool
+	err      error
+}
+
+func initialModel() model {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	return model{spinner: s}
+}
+
+func (m model) Init() tea.Cmd {
+	return m.spinner.Tick
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.quitting {
+		return m, tea.Quit
+	}
+	var cmd tea.Cmd
+	m.spinner, cmd = m.spinner.Update(msg)
+	return m, cmd
+}
+
+func (m model) View() string {
+	if m.err != nil {
+		return m.err.Error()
+	}
+	str := fmt.Sprintf("\n   %s Cleaning up....", m.spinner.View())
+	if m.quitting {
+		return str + "\n"
+	}
+	return str
 }

@@ -29,7 +29,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cheggaaa/pb"
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/pkg/console"
@@ -37,10 +36,9 @@ import (
 
 var (
 	globalContext, globalCancel = context.WithCancel(context.Background())
-	globalTermWidth             = 120
 
 	// number of concurrent workers
-	concurrency = 100
+	concurrency = 50
 )
 
 const (
@@ -105,11 +103,12 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "output, o",
-			Usage: "specify output path for confess log",
+			Usage: "specify output file for confess log",
 		},
-		cli.StringFlag{
+		cli.DurationFlag{
 			Name:  "duration, d",
 			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
+			Value: 30 * time.Minute,
 		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
@@ -125,8 +124,9 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on "mybucket"
-     $ confess --access-key minio --secret-key minio123 --bucket "mybucket" http://minio{1...4}:9000
+  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on "mybucket". If you are running this
+     tool against a new object store, it is recommended to set test duration of atleast 24 hours.
+     $ confess --access-key minio --secret-key minio123 --bucket "mybucket" --o /tmp/confess.out --duration 30m http://minio{1...4}:9000
 `
 	app.Action = confessMain
 	app.Run(os.Args)
@@ -134,11 +134,13 @@ EXAMPLES:
 
 func checkMain(ctx *cli.Context) {
 	if !ctx.Args().Present() {
-		console.Fatalln(fmt.Errorf("not arguments found, please check documentation '%s --help'", ctx.App.Name))
+		cli.ShowCommandHelp(ctx, ctx.Command.Name)
+		os.Exit(1)
 	}
 	if ctx.String("bucket") == "" {
 		console.Fatalln("--bucket flag needs to be set")
 	}
+
 	if !ctx.IsSet("access-key") || !ctx.IsSet("secret-key") {
 		console.Fatalln("--access-key and --secret-key flags needs to be set")
 	}
@@ -175,19 +177,17 @@ func confessMain(ctx *cli.Context) {
 
 	rand.Seed(time.Now().UnixNano())
 	nodeState := newNodeState(ctx)
+	if err := nodeState.checkBucket(ctx.String("bucket")); err != nil {
+		console.Fatalln(err)
+	}
 	nodeState.init(globalContext)
 
 	var builder bytes.Buffer
 	startupBanner(&builder)
 	console.Println(builder.String())
 
-	// set terminal size if available.
-	if w, e := pb.GetTerminalWidth(); e == nil {
-		globalTermWidth = w
-	}
-
 	// Monitor OS exit signals and cancel the global context in such case
-	go nodeState.trapSignals(os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
+	go nodeState.trapSignals(os.Interrupt, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT)
 	go func() {
 		e := nodeState.runTests(globalContext)
 		if e != nil && !errors.Is(e, context.Canceled) {
@@ -195,5 +195,5 @@ func confessMain(ctx *cli.Context) {
 		}
 	}()
 
-	nodeState.finish(globalContext)
+	nodeState.finish()
 }

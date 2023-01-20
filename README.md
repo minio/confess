@@ -23,8 +23,8 @@ FLAGS:
   --version, -v             print the version
   
 EXAMPLES:
-  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on bucket "mybucket"
-     $ confess --access-key minio --secret-key minio123 --bucket mybucket http://minio{1...4}:9000 
+  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on bucket "mybucket" for 10 minutes
+     $ confess --access-key minio --secret-key minio123 --bucket mybucket --duration 10m http://minio{1...4}:9000 
 ```
 
 ## License

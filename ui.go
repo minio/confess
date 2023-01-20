@@ -23,10 +23,23 @@ import (
 )
 
 var (
-	baseStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("14")).
+	tblBorder = lipgloss.Border{
+		Top:      "-",
+		Left:     "|",
+		Right:    "|",
+		TopLeft:  "+",
+		TopRight: "+",
+	}
+	bassStyle = lipgloss.NewStyle().
 			Background(lipgloss.Color("0")).
-			Bold(false).Width(15)
+			Width(106).
+			Bold(false).BorderStyle(tblBorder)
+	errMsgStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("204")).
+			Bold(true)
+	nodeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#ffffff")).
+			Bold(true)
 	whiteStyle = lipgloss.NewStyle().
 			Bold(false).
 			Foreground(lipgloss.Color("#ffffff"))
@@ -34,14 +47,9 @@ var (
 	warnColor = lipgloss.AdaptiveColor{Light: "#bf4364", Dark: "#e31441"}
 	special   = lipgloss.AdaptiveColor{Light: "#22E32F", Dark: "#07E316"}
 
-	divider = lipgloss.NewStyle().
-		SetString("•").
-		Padding(0, 1).
-		Foreground(subtle).
-		String()
-
 	advisory = lipgloss.NewStyle().Foreground(special).Render
 	warn     = lipgloss.NewStyle().Foreground(warnColor).Render
+
 	// Status Bar.
 
 	statusBarStyle = lipgloss.NewStyle().
@@ -96,33 +104,4 @@ func getHeader(ctx *cli.Context) string {
 	}
 	s.WriteString("\n")
 	return s.String()
-}
-
-type tableColumn struct {
-	Title string
-	Width int
-	Style lipgloss.Style
-}
-
-func getColumns() []tableColumn {
-	baseStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("14")).
-		Background(lipgloss.Color("0")).
-		Bold(true).Width(15)
-
-	return []tableColumn{
-		{Title: "Node", Width: 20, Style: baseStyle},
-		{
-			Title: "Path", Width: 40, Style: baseStyle.Copy().
-				Foreground(lipgloss.Color("231")).
-				Background(lipgloss.Color("0")).
-				Bold(false),
-		},
-		{Title: "FuncName", Width: 4, Style: baseStyle.Copy().
-			Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("0")).
-			Bold(false)},
-		{Title: "Error", Width: 80, Style: baseStyle.Copy().
-			Foreground(lipgloss.Color("#3C3C3C"))},
-	}
 }
