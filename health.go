@@ -88,6 +88,9 @@ func (h *hcClient) setOnline() {
 func (h *hcClient) isOnline() bool {
 	return atomic.LoadInt32(&h.Online) == 1
 }
+func (h *hcClient) isOffline() bool {
+	return atomic.LoadInt32(&h.Online) == 0
+}
 
 type epHealth struct {
 	Online   bool
@@ -159,8 +162,11 @@ func (hc *hcClient) healthCheck(ctx context.Context, resultsCh chan epHealth) er
 	if err == nil {
 		// Drain the connection.
 		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
 	}
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
+
 	result := epHealth{
 		Endpoint: hc.EndpointURL,
 	}
@@ -169,7 +175,6 @@ func (hc *hcClient) healthCheck(ctx context.Context, resultsCh chan epHealth) er
 	} else {
 		result.Online = true
 	}
-
 	if err != nil {
 		result.Error = err
 	}

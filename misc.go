@@ -18,16 +18,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"io"
-	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
 	"github.com/minio/console/pkg"
 	md5simd "github.com/minio/md5-simd"
@@ -116,20 +112,4 @@ func mustGetSystemCertPool() *x509.CertPool {
 		return x509.NewCertPool()
 	}
 	return pool
-}
-
-func newRandomReader(seed, size int64) io.Reader {
-	return io.LimitReader(rand.New(rand.NewSource(seed)), size)
-}
-
-// read data from file if it exists or optionally create a buffer of particular size
-func getDataReader(size int64) io.ReadCloser {
-	return ioutil.NopCloser(newRandomReader(size, size))
-}
-
-func getMultipartObjsize(n int) int {
-	if n == 1 {
-		return humanize.MiByte * 5
-	}
-	return (n-1)*humanize.MiByte*5 + 1
 }

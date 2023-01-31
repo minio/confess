@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -35,19 +33,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
+	"github.com/minio/confess/node"
+	"github.com/minio/confess/ops"
+	"github.com/minio/confess/tests"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
 	"github.com/minio/pkg/ellipses"
-	"github.com/olekukonko/tablewriter"
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 )
-
-// node represents an endpoint to S3 object store
-type node struct {
-	endpointURL *url.URL
-	client      *minio.Client
-}
 
 // TestStats
 type TestStats struct {
@@ -74,18 +66,22 @@ type TestMetrics struct {
 	HeadStats TestStats
 	ListStats TestStats
 }
+type TestInfo struct {
+	Test  tests.Tester
+	Retry tests.RetryInfo
+}
 type nodeState struct {
-	Prefixes []string
-	nodes    []*node
-	hc       *healthChecker
-	cliCtx   *cli.Context
-	resCh    chan testResult
-	testCh   chan OpSequence
-	doneCh   chan struct{}
+	node.NodeSlc
+	hc     *healthChecker
+	cliCtx *cli.Context
+	resCh  chan interface{}
+	testCh chan TestInfo
+	doneCh chan struct{}
 	// track offline nodes
 	nlock      sync.RWMutex
 	offlineMap map[string]bool
 
+	registry *tests.Registry
 	// stats
 	model   model
 	metrics TestMetrics
@@ -94,7 +90,7 @@ type nodeState struct {
 
 func newNodeState(ctx *cli.Context) *nodeState {
 	var endpoints []string
-	var nodes []*node
+	var nodes []*node.Node
 	now := time.Now()
 	for _, hostStr := range ctx.Args() {
 		hosts := strings.Split(hostStr, ",")
@@ -139,42 +135,48 @@ func newNodeState(ctx *cli.Context) *nodeState {
 			console.Fatalln(fmt.Errorf("could not initialize client for %s",
 				endpoint))
 		}
-		n := &node{
-			endpointURL: target,
-			client:      clnt,
-		}
-		nodes = append(nodes, n)
 		hcClient, err := newHCClient(target)
 		if err != nil {
 			console.Fatalln(fmt.Errorf("could not initialize client for %s", endpoint))
 		}
 		hcMap[target.Host] = &hcClient
+
+		n := &node.Node{
+			EndpointURL: target,
+			Client:      clnt,
+			HCFn:        hcClient.isOffline,
+		}
+		nodes = append(nodes, n)
 	}
 	var pfxes []string
 	for i := 0; i < 10; i++ {
-		pfxes = append(pfxes, fmt.Sprintf("confess_%s/pfx%d", now.Format("01-02-2006-15-04-05"), i))
+		pfxes = append(pfxes, fmt.Sprintf("confess/%s/pfx%d", now.Format("01_02_06_15:04"), i))
 	}
 	return &nodeState{
 		metrics:    TestMetrics{startTime: now},
 		offlineMap: make(map[string]bool),
-		nodes:      nodes,
 		hc:         newHealthChecker(ctx, hcMap),
 		cliCtx:     ctx,
-		resCh:      make(chan testResult, 100),
-		testCh:     make(chan OpSequence, 1000),
+		resCh:      make(chan interface{}, 10000),
+		testCh:     make(chan TestInfo, 100),
 		doneCh:     make(chan struct{}, 1),
-		Prefixes:   pfxes,
-		model:      initialModel(),
+		NodeSlc: node.NodeSlc{
+			Prefixes: pfxes,
+			Nodes:    nodes,
+			Bucket:   ctx.String("bucket"),
+		},
+		model:    initialModel(),
+		registry: tests.LoadRegistry(),
 	}
 }
 
 // disallow test on object locked bucket
 func (n *nodeState) checkBucket(bucket string) error {
-	for _, node := range n.nodes {
-		if n.hc.isOffline(node.endpointURL) {
+	for _, node := range n.Nodes {
+		if n.hc.isOffline(node.EndpointURL) {
 			continue
 		}
-		_, _, _, _, err := node.client.GetObjectLockConfig(context.Background(), bucket)
+		_, _, _, _, err := node.Client.GetObjectLockConfig(context.Background(), bucket)
 		if err == nil {
 			return fmt.Errorf("%s is object lock enabled. Please use another bucket", bucket)
 		}
@@ -183,15 +185,14 @@ func (n *nodeState) checkBucket(bucket string) error {
 		case "NoSuchBucket":
 			return fmt.Errorf("bucket `%s` does not exist ", bucket)
 		default:
+			vcfg, err := node.Client.GetBucketVersioning(context.Background(), bucket)
+			if err == nil {
+				n.VersioningEnabled = vcfg.Enabled()
+			}
 			return nil
 		}
 	}
 	return nil
-}
-
-func (n *nodeState) getRandomPfx() string {
-	idx := rand.Intn(len(n.Prefixes))
-	return n.Prefixes[idx]
 }
 
 // addWorker creates a new worker to process op sequence
@@ -203,23 +204,12 @@ func (n *nodeState) addWorker(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				for op := range n.testCh {
-					if op.Retry.OK {
-						n.resCh <- testResult{
-							Err:       op.Retry.Err,
-							Path:      fmt.Sprintf("%s/%s", n.cliCtx.String("bucket"), op.Retry.ObjInfo.Key),
-							TestName:  op.Retry.TestName,
-							StartTime: time.Now(),
-							EndTime:   time.Now(),
-						}
-					}
-				}
 				return
-			case ops, ok := <-n.testCh:
+			case t, ok := <-n.testCh:
 				if !ok {
 					return
 				}
-				ops.Test(ctx, ops.Retry)
+				t.Test.Run(ctx, n.NodeSlc, n.resCh, t.Retry)
 			}
 		}
 	}()
@@ -246,8 +236,9 @@ func (n *nodeState) hcStatus(epURL *url.URL) (s statusChg) {
 }
 
 type statusChg struct {
-	epURL  *url.URL
-	status string
+	epURL     *url.URL
+	status    string
+	timestamp time.Time
 }
 
 func (s statusChg) String() string {
@@ -286,11 +277,20 @@ func (n *nodeState) init(ctx context.Context) {
 						os.Exit(1)
 					}
 				}()
+				for rs := range n.resCh {
+					if res, ok := rs.(ops.Result); ok {
+						if res.Err != nil && !errors.Is(res.Err, context.Canceled) && !errors.Is(res.Err, ops.ErrNodeOffline) {
+							if _, err := f.WriteString(res.String() + "\n"); err != nil {
+								console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+							}
+						}
+					}
 
-				for res := range n.resCh {
-					if res.Err != nil && !errors.Is(res.Err, context.Canceled) {
-						if _, err := f.WriteString(res.String() + "\n"); err != nil {
-							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+					if res, ok := rs.(tests.Result); ok {
+						if res.Err != nil && !errors.Is(res.Err, context.Canceled) && !errors.Is(res.Err, ops.ErrNodeOffline) {
+							if _, err := f.WriteString(res.String() + "\n"); err != nil {
+								console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+							}
 						}
 					}
 				}
@@ -300,46 +300,66 @@ func (n *nodeState) init(ctx context.Context) {
 				}
 				fwriter.Flush()
 				f.Close()
-				n.cleanup() // finish clean up
+				ops.Cleanup(n.Bucket, n.Prefixes, n.Nodes) // finish clean up
 				n.model.quitting = true
-				n.printSummary()
+				console.Println(n.statusBar())
+
 				n.doneCh <- struct{}{}
 				return
-			case res, ok := <-n.resCh:
+			case rs, ok := <-n.resCh:
 				if !ok {
 					return
 				}
+				res, ok := rs.(ops.Result)
+				var statusChg statusChg
 				eraseOnce := false
-				statusChg := n.hcStatus(res.Node)
-				if statusChg.status != "" {
-					eraseOnce = n.printWithErase(eraseOnce, statusChg.Render())
-					if _, err := f.WriteString(fmt.Sprintf("%s %s %s\n", res.StartTime.Format(time.RFC3339Nano), res.EndTime.Format(time.RFC3339Nano), statusChg.String())); err != nil {
-						console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
-					}
-				}
-				if res.Err != nil {
-					if !errors.Is(res.Err, errNodeOffline) || !res.RetryRequest || !res.AbortTest {
-						if _, err := f.WriteString(res.String() + "\n"); err != nil {
+				if ok {
+					statusChg = n.hcStatus(res.Node)
+					if statusChg.status != "" {
+						statusChg.timestamp = res.EndTime
+						eraseOnce = n.printWithErase(eraseOnce, statusChg.Render())
+						if _, err := f.WriteString(fmt.Sprintf("%s %s %s\n", res.StartTime.Format(time.RFC3339Nano), res.EndTime.Format(time.RFC3339Nano), statusChg.String())); err != nil {
 							console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
 						}
 					}
-				}
-
-				totsuccess := atomic.LoadInt32(&n.metrics.numTests) - atomic.LoadInt32(&n.metrics.numFailed)
-				if !errors.Is(res.Err, errNodeOffline) {
-					// summarize the stats here
-					atomic.AddInt32(&n.metrics.numTests, 1)
 					if res.Err != nil {
-						if !res.RetryRequest && !res.AbortTest {
-							atomic.AddInt32(&n.metrics.numFailed, 1)
+						if !errors.Is(res.Err, ops.ErrNodeOffline) && !res.RetryRequest && !res.AbortTest {
+							if _, err := f.WriteString(res.String() + "\n"); err != nil {
+								console.Fatalf("unable to write to 'confess' log for %s: %s\n", res, err)
+							}
+							eraseOnce = n.printWithErase(eraseOnce, n.printRow(res))
 						}
-					} else {
-						totsuccess++
 					}
-					if res.Err != nil && !res.RetryRequest && !res.AbortTest {
-						eraseOnce = n.printWithErase(eraseOnce, n.printRow(res))
+
+				}
+				if res, ok := rs.(tests.Result); ok {
+					statusChg = n.hcStatus(res.Node)
+					if statusChg.status != "" {
+						statusChg.timestamp = res.EndTime
+						eraseOnce = n.printWithErase(eraseOnce, statusChg.Render())
 					}
-					n.updateMetrics(ctx, res)
+					totsuccess := atomic.LoadInt32(&n.metrics.numTests) - atomic.LoadInt32(&n.metrics.numFailed)
+					if !errors.Is(res.Err, ops.ErrNodeOffline) {
+						// summarize the stats here
+						if res.Status == tests.Started {
+							atomic.AddInt32(&n.metrics.numTests, 1)
+						}
+						if res.Err != nil {
+							if !res.AbortTest && !res.IsRetry {
+								atomic.AddInt32(&n.metrics.numFailed, 1)
+							}
+							if res.IsRetry {
+								test := n.registry.GetTestByName(res.TestName)
+								n.queueTest(ctx, TestInfo{Test: test, Retry: res.Retry})
+							}
+						} else {
+							totsuccess++
+						}
+						if n.metrics.numFailed >= int32(n.cliCtx.Int("fail-after")) {
+							console.Println(whiteStyle.Render("Too many failures, shutting down..."))
+							globalCancel()
+						}
+					}
 				}
 				select { // fix status bar flicker
 				case <-ticker.C:
@@ -353,76 +373,42 @@ func (n *nodeState) init(ctx context.Context) {
 		}
 	}()
 }
-func (n *nodeState) updateMetrics(ctx context.Context, res testResult) {
-	switch res.Method {
-	case http.MethodHead:
-		n.metrics.HeadStats.TotalTests++
-		if res.Err != nil {
-			n.metrics.HeadStats.TotalFailures++
-		} else {
-			n.metrics.HeadStats.TotalBytesWritten += uint64(res.data.Size)
-		}
-	case http.MethodGet:
-		n.metrics.GetStats.TotalTests++
-		if res.Err != nil {
-			n.metrics.GetStats.TotalFailures++
-		} else {
-			n.metrics.GetStats.TotalBytesWritten += uint64(res.data.Size)
-		}
-	case ListType:
-		n.metrics.ListStats.TotalTests++
-		if res.Err != nil {
-			n.metrics.ListStats.TotalFailures++
-		} else {
-			n.metrics.ListStats.TotalBytesWritten += uint64(res.data.Size)
-		}
+
+// prints line to console - erase status bar if erased is true
+func (n *nodeState) printWithErase(erased bool, msg string) bool {
+	if !erased {
+		console.Eraseline()
+	}
+
+	console.Print(msg + "\r")
+	return true
+}
+
+func (n *nodeState) queueTest(ctx context.Context, ti TestInfo) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+		n.testCh <- ti
 	}
 }
 
-func (n *nodeState) printSummary() {
-	var s strings.Builder
-
-	table := tablewriter.NewWriter(&s)
-	table.SetAutoWrapText(false)
-	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetBorder(true)
-	table.SetRowLine(false)
-	addRow := func(s string) {
-		table.Append([]string{s})
+func (n *nodeState) runTests(ctx context.Context) (err error) {
+	for {
+		select {
+		case <-ctx.Done():
+			close(n.testCh)
+			return
+		default:
+			if n.hc.allOffline() {
+				continue
+			}
+			test := n.registry.GetRandomTest()
+			for i := 0; i < test.Concurrency(); i++ {
+				n.queueTest(ctx, TestInfo{Test: test})
+			}
+		}
 	}
-	title := metricsTitle
-	_ = addRow
-	addRowF := func(format string, vals ...interface{}) {
-		s := fmt.Sprintf(format, vals...)
-		table.Append([]string{s})
-	}
-	uiSuccessStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("118")).
-		Bold(true)
-	uiFailedStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("190")).
-		Bold(true)
-	success := uiSuccessStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numTests)-atomic.LoadInt32(&n.metrics.numFailed)))
-	failures := uiFailedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numFailed)))
-
-	addRowF(title("Total Operations succeeded:")+"   %s;"+title(" Total failed ")+" %s in %s", success, failures, humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
-	addRow("-------------------------------------- Confess Run Statistics -------------------------------------------")
-	addRowF(title("GET:  ") + fmt.Sprintf("  %s operations; %s failed",
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalTests))),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.GetStats.TotalFailures)))))
-	addRowF(title("HEAD: ") + fmt.Sprintf("  %s operations; %s failed",
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalTests))),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.HeadStats.TotalFailures)))))
-	addRowF(title("LIST: ") + fmt.Sprintf("  %s operations; %s failed",
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalTests))),
-		whiteStyle.Render(humanize.Comma(int64(n.metrics.ListStats.TotalFailures)))))
-
-	table.Render()
-	console.Println(s.String())
-}
-func metricsTitle(s string) string {
-	return console.Colorize("metrics-title", s)
 }
 
 // wait on workers to finish
@@ -430,6 +416,7 @@ func (n *nodeState) finish() {
 	<-globalContext.Done()
 	n.wg.Wait()
 	close(n.resCh)
+
 	<-n.doneCh
 }
 
@@ -507,27 +494,36 @@ exitfor:
 // return summary for logfile
 func (n *nodeState) summaryMsg() string {
 	success := atomic.LoadInt32(&n.metrics.numTests) - atomic.LoadInt32(&n.metrics.numFailed)
-	return fmt.Sprintf("Operations succeeded=%d Operations Failed=%d Duration=%s\n", success, atomic.LoadInt32(&n.metrics.numFailed), humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
+	return fmt.Sprintf("Test succeeded=%d Tests Failed=%d Duration=%s\n", success, atomic.LoadInt32(&n.metrics.numFailed), humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 }
 
 func (n *nodeState) statusBar() string {
-	width := 108
+	width := globalTermWidth - 2
+	if width > 100 {
+		width = 100
+	}
 	statusKey := statusStyle.Render(" STATUS")
 	success := successStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numTests)-atomic.LoadInt32(&n.metrics.numFailed)))
 	failures := failedStyle.Render(fmt.Sprintf("%d ", atomic.LoadInt32(&n.metrics.numFailed)))
-	bar := statusKey + statusTextStyle.Render("  Operations succeeded=") + success +
-		statusTextStyle.Render("Operations Failed=") + failures +
+	bar := statusKey + statusTextStyle.Render("  Tests succeeded=") + success +
+		statusTextStyle.Render("Tests Failed=") + failures +
 		statusTextStyle.Render("Duration= "+humanize.RelTime(n.metrics.startTime, time.Now(), "", ""))
 	return statusBarStyle.Width(width).Render(bar)
 }
 
-var titleCase = cases.Title(language.English)
-
-func (n *nodeState) printRow(r testResult) string {
-	errMsg := fmt.Sprintf(" %s failed %s consistency", r.Path, titleCase.String(r.Method))
-	columnA := "  " + nodeStyle.Render(r.Node.Host) + " | "
-	columnB := errMsgStyle.Width(80).Render(lipgloss.JoinVertical(lipgloss.Left, errMsg))
-	return bassStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, columnA, columnB))
+func (n *nodeState) printRow(r ops.Result) string {
+	errMsg := fmt.Sprintf("%s failed %s test", r.Path, r.TestName)
+	columnA := fmt.Sprintf("%s | %s | ", n.metrics.startTime.Format("2006-01-02 15:04:05"), nodeStyle.Render(r.Node.Host))
+	width := globalTermWidth - len(columnA) - 2
+	if width <= 0 {
+		width = len(columnA)
+	}
+	height := 3 + len(errMsg)/width
+	columnB := errMsgStyle.MaxWidth(width).Width(width).Height(height).Render(lipgloss.JoinHorizontal(lipgloss.Left, errMsg))
+	if globalTermWidth > 0 {
+		baseStyle = baseStyle.MaxWidth(globalTermWidth - 2)
+	}
+	return baseStyle.Width(globalTermWidth - 2).Render(lipgloss.JoinHorizontal(lipgloss.Left, columnA, columnB))
 }
 
 func (s statusChg) Render() string {
@@ -540,9 +536,8 @@ func (s statusChg) Render() string {
 	default:
 		return ""
 	}
-	columnA := "  " + nodeStyle.Render(s.epURL.Host) + " | "
-	return bassStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, columnA, columnB))
-
+	columnA := s.timestamp.Format("2006-01-02 15:04:05") + " | " + nodeStyle.Render(s.epURL.Host) + " | "
+	return baseStyle.Width(globalTermWidth).Render(lipgloss.JoinHorizontal(lipgloss.Left, columnA, columnB) + "\n")
 }
 
 type model struct {

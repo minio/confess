@@ -7,7 +7,7 @@ NAME:
   confess - Object store consistency checker
 
 USAGE:
-  confess - HOSTS [FLAGS]
+  confess - [FLAGS] HOSTS
 
 HOSTS:
   HOSTS is a comma separated list or a range of hostnames/ip-addresses
@@ -19,12 +19,14 @@ FLAGS:
   --region value            specify a custom region [$CONFESS_REGION]
   --bucket value            Bucket to use for confess tests [$CONFESS_BUCKET]
   --output value, -o value  specify output path for confess log
-  --help, -h                show help
-  --version, -v             print the version
-  
+  --duration value, -d value    Duration to run the tests. Use 's' and 'm' to specify seconds and minutes. (default: 30m0s)
+  --fail-after value, -f value  fail after n errors. Defaults to 100 (default: 100)
+  --help, -h                    show help
+  --version, -v                 print the version
+
 EXAMPLES:
   1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on bucket "mybucket" for 10 minutes
-     $ confess --access-key minio --secret-key minio123 --bucket mybucket --duration 10m http://minio{1...4}:9000 
+     $ confess --access-key minio --secret-key minio123 --bucket mybucket --duration 10m --fail-after 50 -o /data/confess.out http://minio{1...4}:9000q
 ```
 
 ## License

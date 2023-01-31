@@ -23,20 +23,16 @@ import (
 )
 
 var (
-	tblBorder = lipgloss.Border{
-		Top:      "-",
-		Left:     "|",
-		Right:    "|",
-		TopLeft:  "+",
-		TopRight: "+",
-	}
-	bassStyle = lipgloss.NewStyle().
+	baseStyle = lipgloss.NewStyle().
 			Background(lipgloss.Color("0")).
 			Width(106).
-			Bold(false).BorderStyle(tblBorder)
+			Bold(false)
 	errMsgStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("204")).
-			Bold(true)
+			Bold(true).
+			Align(lipgloss.Left).
+			Height(5).
+			Width(50)
 	nodeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#ffffff")).
 			Bold(true)

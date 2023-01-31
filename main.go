@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cheggaaa/pb"
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/pkg/console"
@@ -36,9 +37,10 @@ import (
 
 var (
 	globalContext, globalCancel = context.WithCancel(context.Background())
+	globalTermWidth             = 120
 
 	// number of concurrent workers
-	concurrency = 50
+	concurrency = 1000
 )
 
 const (
@@ -110,6 +112,11 @@ func main() {
 			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
 			Value: 30 * time.Minute,
 		},
+		cli.IntFlag{
+			Name:  "fail-after, f",
+			Usage: "fail after n errors. Defaults to 100",
+			Value: 100,
+		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}
@@ -124,9 +131,8 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on "mybucket". If you are running this
-     tool against a new object store, it is recommended to set test duration of atleast 24 hours.
-     $ confess --access-key minio --secret-key minio123 --bucket "mybucket" --o /tmp/confess.out --duration 30m http://minio{1...4}:9000
+   1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000) on "mybucket".
+      $ confess --access-key minio --secret-key minio123 --bucket "mybucket" --o /tmp/confess.out --duration 30m http://minio{1...4}:9000
 `
 	app.Action = confessMain
 	app.Run(os.Args)
@@ -170,6 +176,7 @@ func getRevision() string {
 }
 
 func confessMain(ctx *cli.Context) {
+	rand.Seed(time.Now().UnixNano())
 	checkMain(ctx)
 	console.SetColor("metrics-duration", color.New(color.FgHiWhite))
 	console.SetColor("metrics-title", color.New(color.FgCyan))
@@ -185,7 +192,10 @@ func confessMain(ctx *cli.Context) {
 	var builder bytes.Buffer
 	startupBanner(&builder)
 	console.Println(builder.String())
-
+	// set terminal size if available.
+	if w, e := pb.GetTerminalWidth(); e == nil {
+		globalTermWidth = w
+	}
 	// Monitor OS exit signals and cancel the global context in such case
 	go nodeState.trapSignals(os.Interrupt, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT)
 	go func() {
