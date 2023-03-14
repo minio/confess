@@ -149,6 +149,7 @@ func LoadRegistry() *Registry {
 	r.Register("PutGetCheck2", PutGetCheck2())
 	r.Register("PutStatCheck", PutStatCheck())
 	r.Register("PutStatCheck2", PutStatCheck2())
+	r.Register("PutStatCheck3", newPutStatCheck3())
 	r.Register("PutListCheck1", newPutListCheckTest1())
 	r.Register("PutListCheck2", newPutListCheckTest2())
 

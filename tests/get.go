@@ -37,7 +37,7 @@ func PutGetCheck() *GenericTest {
 			"Key2":      "Confess"},
 	})
 	// this function sets up options needed for the test.Write custom function if you like.
-	t.TestOpFn = t.setupGetOp()
+	t.TestOpFns = []TestOpFn{t.setupGetOp()}
 	// this function sets up options needed for the teardown - performs versioned delete.
 	t.CleanupOpFn = t.setupDelOp()
 	return t
@@ -57,7 +57,7 @@ func PutGetCheck2() *GenericTest {
 			"Customkey": "extra  spaces  in   value",
 			"Key2":      "Confess"},
 	})
-	t.TestOpFn = t.setupGetOp()
+	t.TestOpFns = []TestOpFn{t.setupGetOp()}
 	t.CleanupOpFn = t.setupDelOp()
 	return t
 }

@@ -92,11 +92,11 @@ func TestGet(ctx context.Context, o GetOpts, node *node.Node) (res Result) {
 }
 
 func TestStat(ctx context.Context, o StatOpts, node *node.Node) (res Result) {
-	testFn := CheckStatConsistency
 	if o.TestStatFn != nil {
-		testFn = o.TestStatFn
+		res = o.TestStatFn(ctx, o, node)
+	} else {
+		res, _ = Stat(ctx, o, node)
 	}
-	res = testFn(ctx, o, node)
 	offline, retryable := IsRetryableError(res.Err, node)
 	res.Offline = offline
 	res.RetryRequest = retryable

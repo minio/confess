@@ -28,10 +28,11 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
+type TestOpFn func(oi minio.ObjectInfo) ops.Op
 type GenericTest struct {
 	Test
 	SetupOpFn    func(string) ops.Op
-	TestOpFn     func(oi minio.ObjectInfo) ops.Op
+	TestOpFns    []TestOpFn
 	TestListOpFn func(expectedCount int, oi minio.ObjectInfo) ops.Op
 	CleanupOpFn  func(oi minio.ObjectInfo) ops.Op
 }
@@ -169,24 +170,27 @@ func (t *GenericTest) Run(ctx context.Context, nodeSlc node.NodeSlc, resCh chan 
 	if !retry {
 		t.markTestStartFn(ctx, startTime, resCh)
 	}
-	op = t.TestOpFn(oi) // setuo consistency test
-
-	opResCh := t.start(ctx, op)
 	var lastErr ops.Result
 	var requeue bool
-	for res := range opResCh {
-		if res.Err != nil {
-			lastErr = res
-		}
-		if res.RetryRequest {
-			requeue = true
-		}
-		select {
-		case resCh <- res:
-		case <-ctx.Done():
-			return
+
+	for _, opFn := range t.TestOpFns {
+		op = opFn(oi) // setup consistency test
+		opResCh := t.start(ctx, op)
+		for res := range opResCh {
+			if res.Err != nil {
+				lastErr = res
+			}
+			if res.RetryRequest {
+				requeue = true
+			}
+			select {
+			case resCh <- res:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
+
 	lastErr.RetryRequest = requeue
 	// mark test as pass|fail
 	t.markTestStatusFn(ctx, startTime, lastErr, resCh)
