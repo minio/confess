@@ -3,8 +3,9 @@ module github.com/minio/confess
 go 1.18
 
 require (
+	github.com/charmbracelet/bubbles v0.15.0
+	github.com/charmbracelet/bubbletea v0.23.1
 	github.com/charmbracelet/lipgloss v0.6.0
-	github.com/cheggaaa/pb v1.0.29
 	github.com/dustin/go-humanize v1.0.0
 	github.com/fatih/color v1.13.0
 	github.com/lithammer/shortuuid/v4 v4.0.0
@@ -14,13 +15,12 @@ require (
 	github.com/minio/minio-go/v7 v7.0.41
 	github.com/minio/pkg v1.5.4
 	github.com/olekukonko/tablewriter v0.0.5
-	golang.org/x/net v0.4.0
+	golang.org/x/net v0.7.0
+	golang.org/x/text v0.7.0
 )
 
 require (
 	github.com/aymanbagabas/go-osc52 v1.2.1 // indirect
-	github.com/charmbracelet/bubbles v0.15.0 // indirect
-	github.com/charmbracelet/bubbletea v0.23.1 // indirect
 	github.com/containerd/console v1.0.3 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -42,8 +42,7 @@ require (
 	github.com/rs/xid v1.4.0 // indirect
 	github.com/sirupsen/logrus v1.9.0 // indirect
 	golang.org/x/crypto v0.1.0 // indirect
-	golang.org/x/sys v0.3.0 // indirect
-	golang.org/x/term v0.3.0 // indirect
-	golang.org/x/text v0.5.0 // indirect
+	golang.org/x/sys v0.5.0 // indirect
+	golang.org/x/term v0.5.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
