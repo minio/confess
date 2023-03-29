@@ -13,30 +13,41 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package node
+package tests
 
 import (
 	"context"
-	"net/url"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"math/rand"
+	"os"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 )
 
-// Node represents an endpoint to S3 object store
-type Node struct {
-	EndpointURL *url.URL
-	Client      *minio.Client
-	HCFn        func() bool
-	HCCanceler  context.CancelFunc
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
-func (n *Node) IsOffline() bool {
-	return n.HCFn()
+// Config represents the test config
+type Config struct {
+	Clients []*minio.Client
+	Bucket  string
+	LogFile *os.File
 }
 
-type NodeSlc struct {
-	Nodes             []*Node
-	Prefixes          []string
-	Bucket            string
-	VersioningEnabled bool
+func newRandomReader(seed, size int64) io.Reader {
+	return io.LimitReader(rand.New(rand.NewSource(seed)), size)
+}
+
+// read data from file if it exists or optionally create a buffer of particular size
+func reader(size int64) io.ReadCloser {
+	return ioutil.NopCloser(newRandomReader(size, size))
+}
+
+func log(ctx context.Context, f *os.File, testName, clientURL, msg string) error {
+	_, err := f.WriteString(fmt.Sprintf("[%s][%s] %s", testName, clientURL, msg) + "\n")
+	return err
 }

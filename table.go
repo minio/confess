@@ -13,19 +13,25 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package data
+package main
 
 import (
-	"io"
-	"io/ioutil"
-	"math/rand"
+	"os"
+
+	"github.com/jedib0t/go-pretty/v6/table"
 )
 
-func newRandomReader(seed, size int64) io.Reader {
-	return io.LimitReader(rand.New(rand.NewSource(seed)), size)
-}
+func newTableWriter(header table.Row, sortBy []table.SortBy, noHeader bool) table.Writer {
+	writer := table.NewWriter()
+	writer.SetOutputMirror(os.Stdout)
+	writer.AppendHeader(header)
+	writer.SortBy(sortBy)
+	if noHeader {
+		writer.ResetHeaders()
+	}
 
-// read data from file if it exists or optionally create a buffer of particular size
-func Reader(size int64) io.ReadCloser {
-	return ioutil.NopCloser(newRandomReader(size, size))
+	style := table.StyleLight
+	writer.SetStyle(style)
+
+	return writer
 }

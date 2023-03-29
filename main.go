@@ -1,4 +1,4 @@
-// Copyright (c) 2022 MinIO, Inc.
+// Copyright (c) 2023 MinIO, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -16,31 +16,28 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/cheggaaa/pb"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fatih/color"
 	"github.com/minio/cli"
+	"github.com/minio/confess/tests"
 	"github.com/minio/pkg/console"
 )
 
 var (
 	globalContext, globalCancel = context.WithCancel(context.Background())
-	globalTermWidth             = 120
-
-	// number of concurrent workers
-	concurrency = 1000
 )
 
 const (
@@ -50,6 +47,7 @@ const (
 var buildInfo = map[string]string{}
 
 func init() {
+	rand.Seed(time.Now().UnixNano())
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, skv := range bi.Settings {
 			buildInfo[skv.Key] = skv.Value
@@ -67,7 +65,7 @@ func main() {
 	app.Author = "MinIO, Inc."
 	app.Description = `Object store consistency checker`
 	app.UsageText = "[FLAGS] HOSTS"
-	app.Copyright = "(c) 2022 MinIO, Inc."
+	app.Copyright = "(c) 2023 MinIO, Inc."
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "access-key",
@@ -138,6 +136,19 @@ EXAMPLES:
 	app.Run(os.Args)
 }
 
+func versionBanner(c *cli.Context) io.Reader {
+	banner := &strings.Builder{}
+
+	version := strings.ReplaceAll(buildInfo["vcs.time"], ":", "-")
+	revision := buildInfo["vcs.revision"]
+
+	fmt.Fprintln(banner, Bold("%s version %s (commit-id=%s)", c.App.Name, version, revision))
+	fmt.Fprintln(banner, Blue("Runtime:")+Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
+	return strings.NewReader(banner.String())
+}
+
 func checkMain(ctx *cli.Context) {
 	if !ctx.Args().Present() {
 		cli.ShowCommandHelp(ctx, ctx.Command.Name)
@@ -146,64 +157,76 @@ func checkMain(ctx *cli.Context) {
 	if ctx.String("bucket") == "" {
 		console.Fatalln("--bucket flag needs to be set")
 	}
-
 	if !ctx.IsSet("access-key") || !ctx.IsSet("secret-key") {
 		console.Fatalln("--access-key and --secret-key flags needs to be set")
 	}
 }
 
-func startupBanner(banner io.Writer) {
-	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
-	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
-	fmt.Fprintln(banner, Blue("Version:")+Bold(" %s (%s %s/%s)", getVersion(), runtime.Version(), runtime.GOOS, runtime.GOARCH))
-}
+func confessMain(c *cli.Context) {
+	checkMain(c)
 
-func versionBanner(c *cli.Context) io.Reader {
-	banner := &strings.Builder{}
-	fmt.Fprintln(banner, Bold("%s version %s (commit-id=%s)", c.App.Name, getVersion(), getRevision()))
-	fmt.Fprintln(banner, Blue("Runtime:")+Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
-	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
-	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
-	return strings.NewReader(banner.String())
-}
+	accessKey := c.String("access-key")
+	secretKey := c.String("secret-key")
+	insecure := c.Bool("insecure")
+	region := c.String("region")
+	signature := c.String("signature")
+	bucket := c.String("bucket")
+	outputFile := c.String("output")
+	duration := c.Duration("duration")
+	hosts := c.Args()
 
-func getVersion() string {
-	return strings.ReplaceAll(buildInfo["vcs.time"], ":", "-")
-}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGSEGV)
 
-func getRevision() string {
-	return buildInfo["vcs.revision"]
-}
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	go func() {
+		s := <-sigs
+		console.Printf(color.RedString("\nExiting on signal %v; %#v\n\n", s.String(), s))
+		cancel()
+		<-time.After(1 * time.Second)
+		os.Exit(1)
+	}()
 
-func confessMain(ctx *cli.Context) {
-	rand.Seed(time.Now().UnixNano())
-	checkMain(ctx)
-	console.SetColor("metrics-duration", color.New(color.FgHiWhite))
-	console.SetColor("metrics-title", color.New(color.FgCyan))
-	console.SetColor("metrics-zero", color.New(color.FgHiWhite))
-
-	rand.Seed(time.Now().UnixNano())
-	nodeState := newNodeState(ctx)
-	if err := nodeState.checkBucket(ctx.String("bucket")); err != nil {
+	executor, err := NewExecutor(ctx, Config{
+		Hosts:      hosts,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		Insecure:   insecure,
+		Region:     region,
+		Signature:  signature,
+		Bucket:     bucket,
+		OutputFile: outputFile,
+		Duration:   duration,
+	})
+	if err != nil {
 		console.Fatalln(err)
 	}
-	nodeState.init(globalContext)
 
-	var builder bytes.Buffer
-	startupBanner(&builder)
-	console.Println(builder.String())
-	// set terminal size if available.
-	if w, e := pb.GetTerminalWidth(); e == nil {
-		globalTermWidth = w
-	}
-	// Monitor OS exit signals and cancel the global context in such case
-	go nodeState.trapSignals(os.Interrupt, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT)
+	var wg sync.WaitGroup
+	m := newProgressModel(executor.Stats)
+	teaProgram := tea.NewProgram(m)
+	wg.Add(1)
 	go func() {
-		e := nodeState.runTests(globalContext)
-		if e != nil && !errors.Is(e, context.Canceled) {
-			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
+		defer wg.Done()
+		if _, err := teaProgram.Run(); err != nil {
+			fmt.Println("error running program:", err)
+			os.Exit(1)
 		}
 	}()
 
-	nodeState.finish()
+	// run tests
+	executor.ExecuteTests(ctx, []Test{
+		&tests.PutListTest{},
+		&tests.PutStatTest{},
+		// new tests can be added here...
+	}, teaProgram)
+
+	teaProgram.Send(progressNotification{
+		done: true,
+	})
+	wg.Wait()
+
+	fmt.Printf("%s \n", color.HiWhiteString(" *** Total Operations Succeeded: %v; Total operations failed: %v *** \n", executor.Stats.Success, executor.Stats.Total-executor.Stats.Success))
+
+	return
 }

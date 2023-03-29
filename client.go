@@ -1,4 +1,4 @@
-// Copyright (c) 2022 MinIO, Inc.
+// Copyright (c) 2023 MinIO, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -12,33 +12,82 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/minio/cli"
 	"github.com/minio/console/pkg"
 	md5simd "github.com/minio/md5-simd"
-	"github.com/minio/pkg/console"
-	"golang.org/x/net/http2"
-
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"golang.org/x/net/http2"
 )
 
-var slashSeparator = "/"
+func newClient(ctx context.Context, endpoint string, config Config) (*minio.Client, error) {
+	endpoint = strings.TrimSuffix(endpoint, slashSeparator)
+	targetURL, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse the endpoint %s; %v", endpoint, err)
+	}
+	if targetURL.Scheme == "" {
+		targetURL.Scheme = "http"
+	}
+	var creds *credentials.Credentials
+	switch strings.ToUpper(config.Signature) {
+	case "S3V4":
+		// if Signature version '4' use NewV4 directly.
+		creds = credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
+	case "S3V2":
+		// if Signature version '2' use NewV2 directly.
+		creds = credentials.NewStaticV2(config.AccessKey, config.SecretKey, "")
+	default:
+		return nil, errors.New("unknown signature method")
+	}
+	isSecured := targetURL.Scheme == "https"
+	clnt, err := minio.New(targetURL.Host, &minio.Options{
+		Creds:        creds,
+		Secure:       isSecured,
+		Region:       config.Region,
+		BucketLookup: minio.BucketLookupAuto,
+		CustomMD5:    md5simd.NewServer().NewHash,
+		Transport:    clientTransport(ctx, isSecured, config),
+	})
+	if err != nil {
+		return nil, err
+	}
+	// start healthcheck on the endpoint
+	cancelFn, err := clnt.HealthCheck(2 * time.Second)
+	if err != nil {
+		return nil, err
+
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				cancelFn()
+				return
+			}
+		}
+	}()
+	clnt.SetAppInfo("confess", pkg.Version)
+	return clnt, nil
+}
 
 // clientTransport returns a new http configuration
 // used while communicating with the host.
-func clientTransport(ctx *cli.Context, enableTLS bool) *http.Transport {
+func clientTransport(ctx context.Context, enableTLS bool, config Config) *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
 	tr := &http.Transport{
@@ -63,7 +112,7 @@ func clientTransport(ctx *cli.Context, enableTLS bool) *http.Transport {
 		// Keep TLS config.
 		tr.TLSClientConfig = &tls.Config{
 			RootCAs:            mustGetSystemCertPool(),
-			InsecureSkipVerify: ctx.Bool("insecure"),
+			InsecureSkipVerify: config.Insecure,
 			// Can't use SSLv3 because of POODLE and BEAST
 			// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
 			// Can't use TLSv1.1 because of RC4 cipher usage
@@ -75,34 +124,6 @@ func clientTransport(ctx *cli.Context, enableTLS bool) *http.Transport {
 	}
 
 	return tr
-}
-
-// getClient creates a client with the specified host and the options set in the context.
-func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
-	var creds *credentials.Credentials
-	switch strings.ToUpper(ctx.String("signature")) {
-	case "S3V4":
-		// if Signature version '4' use NewV4 directly.
-		creds = credentials.NewStaticV4(ctx.String("access-key"), ctx.String("secret-key"), "")
-	case "S3V2":
-		// if Signature version '2' use NewV2 directly.
-		creds = credentials.NewStaticV2(ctx.String("access-key"), ctx.String("secret-key"), "")
-	default:
-		console.Fatalln(errors.New("unknown signature method. S3V2 and S3V4 is available"), strings.ToUpper(ctx.String("signature")))
-	}
-	cl, err := minio.New(hostURL.Host, &minio.Options{
-		Creds:        creds,
-		Secure:       hostURL.Scheme == "https",
-		Region:       ctx.String("region"),
-		BucketLookup: minio.BucketLookupAuto,
-		CustomMD5:    md5simd.NewServer().NewHash,
-		Transport:    clientTransport(ctx, hostURL.Scheme == "https"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	cl.SetAppInfo("confess", pkg.Version)
-	return cl, nil
 }
 
 // mustGetSystemCertPool - return system CAs or empty pool in case of error (or windows)
