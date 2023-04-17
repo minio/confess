@@ -25,7 +25,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/minio/confess/stats"
 	"github.com/minio/confess/tests"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
@@ -35,6 +34,16 @@ import (
 
 var slashSeparator = "/"
 
+// Signature denotes the s3 signature type.
+type Signature string
+
+const (
+	// SignatureV4 denotes s3v4 algorithm
+	SignatureV4 Signature = "s3v4"
+	// SignatureV2 denotes s3v2 algorithm
+	SignatureV2 Signature = "s3v2"
+)
+
 // Config represents the confess executor configuration.
 type Config struct {
 	Hosts      []string      `json:"hosts"`
@@ -42,20 +51,20 @@ type Config struct {
 	SecretKey  string        `json:"secretKey"`
 	Insecure   bool          `json:"insecure,omitempty"`
 	Region     string        `json:"region,omitempty"`
-	Signature  string        `json:"signature"`
+	Signature  Signature     `json:"signature"`
 	Bucket     string        `json:"bucket"`
 	OutputFile string        `json:"outputFile"`
+	FailAfter  int64         `json:"failAfter"`
 	Duration   time.Duration `json:"duration"`
-	FailAfter  int           `json:"failAfter"`
 }
 
-// Test Interface
+// Test interface defines the test.
 type Test interface {
 	Name() string
-	Init(ctx context.Context, config tests.Config, stats *stats.APIStats) error
-	PreRun(ctx context.Context) error
+	Init(ctx context.Context, config tests.Config, stats *tests.Stats) error
+	Setup(ctx context.Context) error
 	Run(ctx context.Context) error
-	PostRun(ctx context.Context) error
+	TearDown(ctx context.Context) error
 }
 
 // Validate - validates the config provided.
@@ -65,11 +74,6 @@ func (c Config) Validate() error {
 	}
 	if c.AccessKey == "" || c.SecretKey == "" {
 		return errors.New("accessKey and secretKey must be set")
-	}
-	switch strings.ToUpper(c.Signature) {
-	case "S3V4", "S3V2":
-	default:
-		return errors.New("unknown signature method. please use s3v4 or s3v2")
 	}
 	if c.Bucket == "" {
 		return errors.New("bucket name should not be empty")
@@ -83,7 +87,9 @@ type Executor struct {
 	Clients              []*minio.Client
 	EnableVersionedTests bool
 	LogFile              string
-	Stats                *stats.APIStats
+	Stats                *tests.Stats
+	Duration             time.Duration
+	FailAfter            int64
 	sLock                sync.Mutex
 }
 
@@ -107,8 +113,8 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 			if perr != nil {
 				console.Fatalln(fmt.Errorf("unable to parse input arg %s: %s", patterns, perr))
 			}
-			for _, lbls := range patterns.Expand() {
-				endpoints = append(endpoints, strings.Join(lbls, ""))
+			for _, values := range patterns.Expand() {
+				endpoints = append(endpoints, strings.Join(values, ""))
 			}
 		}
 	}
@@ -126,14 +132,11 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 	}
 	// Check if the bucket has object lock enabled.
 	_, _, _, _, err = client.GetObjectLockConfig(ctx, config.Bucket)
-	if err == nil {
+	switch {
+	case err != nil && minio.ToErrorResponse(err).Code != "ObjectLockConfigurationNotFoundError":
+		return nil, fmt.Errorf("unable to get object lock config; %v", err)
+	case err == nil:
 		return nil, errors.New("object locking is enabled on this bucket, please use a different one")
-	} else {
-		switch minio.ToErrorResponse(err).Code {
-		case "ObjectLockConfigurationNotFoundError":
-		default:
-			return nil, fmt.Errorf("unable to get object lock config; %v", err)
-		}
 	}
 	// Check if the bucket has versioning enabled.
 	versionConfig, err := client.GetBucketVersioning(ctx, config.Bucket)
@@ -145,7 +148,9 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 		Clients:              clients,
 		EnableVersionedTests: versionConfig.Enabled(),
 		LogFile:              config.OutputFile,
-		Stats:                &stats.APIStats{},
+		Duration:             config.Duration,
+		FailAfter:            config.FailAfter,
+		Stats:                &tests.Stats{},
 	}, nil
 }
 
@@ -157,41 +162,40 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []Test, teaProgram *t
 	}
 	defer f.Close()
 
-	progressMap := &sync.Map{}
-	startTest := func(test Test) {
-		progressMap.Store(test.Name(), progressLog{
-			log: fmt.Sprintf("Running test '%s'", test.Name()),
-		})
-		teaProgram.Send(progressNotification{
-			progressLogs: toProgressLogs(tests, progressMap),
-		})
-	}
+	ctx, cancel := context.WithTimeout(ctx, e.Duration)
+	defer cancel()
 
-	endTest := func(test Test, err error) {
-		progressMap.Store(test.Name(), progressLog{
-			log: func() string {
-				if err != nil {
-					return fmt.Sprintf("Test '%s' failed to succeed", test.Name())
+	// Monitor the failure count w.r.t fail-after value.
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				totalCount, successCount := e.Stats.Info()
+				failureCount := totalCount - successCount
+				if failureCount > e.FailAfter {
+					teaProgram.Send(notification{
+						err: errors.New("exceeded fail-after count"),
+					})
+					return
 				}
-				return fmt.Sprintf("Successfully completed the test '%s'", test.Name())
-			}(),
-			done: true,
-			err:  err,
-		})
-		teaProgram.Send(progressNotification{
-			progressLogs: toProgressLogs(tests, progressMap),
-			err:          err,
-		})
-	}
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
-	for i, _ := range tests {
+	for i := range tests {
 		wg.Add(1)
 		go func(test Test) {
 			defer wg.Done()
-			startTest(test)
-			err = e.executeTest(ctx, test, f)
-			endTest(test, err)
+			if err = e.executeTest(ctx, test, f); err != nil {
+				teaProgram.Send(notification{
+					err: err,
+				})
+			}
 		}(tests[i])
 	}
 	wg.Wait()
@@ -199,36 +203,25 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []Test, teaProgram *t
 	return nil
 }
 
-func toProgressLogs(tests []Test, progressMap *sync.Map) (logs []progressLog) {
-	for _, test := range tests {
-		log, ok := progressMap.Load(test.Name())
-		if ok {
-			logs = append(logs, log.(progressLog))
-		}
-	}
-	return
-}
-
 func (e *Executor) executeTest(ctx context.Context, test Test, logFile *os.File) (err error) {
 	defer func() {
-		err = test.PostRun(ctx)
+		err = test.TearDown(ctx)
 		if err != nil {
-			err = fmt.Errorf("Error while cleaning up %s; %v", test.Name(), err)
+			err = fmt.Errorf("Error while tearing down '%s' test; %v", test.Name(), err)
 		}
 	}()
-
 	if err := test.Init(ctx, tests.Config{
 		Clients: e.Clients,
 		Bucket:  e.Bucket,
 		LogFile: logFile,
 	}, e.Stats); err != nil {
-		return fmt.Errorf("Error while initializing test %s; %v", test.Name(), err)
+		return fmt.Errorf("Error while initializing '%s' test; %v", test.Name(), err)
 	}
-	if err := test.PreRun(ctx); err != nil {
-		return fmt.Errorf("Error while running pre-run for test %s; %v", test.Name(), err)
+	if err := test.Setup(ctx); err != nil {
+		return fmt.Errorf("Error while setting up '%s' test; %v", test.Name(), err)
 	}
 	if err := test.Run(ctx); err != nil {
-		return fmt.Errorf("Error while running test %s; %v", test.Name(), err)
+		return fmt.Errorf("Error while running '%s' test; %v", test.Name(), err)
 	}
 	return
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
+// GetRandomClient fetches a random client from the provided list of clients.
 func GetRandomClient(clients []*minio.Client) (*minio.Client, error) {
 	visitedIds := make(map[int]struct{})
 	idx := rand.Intn(len(clients))

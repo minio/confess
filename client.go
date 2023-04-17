@@ -44,11 +44,11 @@ func newClient(ctx context.Context, endpoint string, config Config) (*minio.Clie
 		targetURL.Scheme = "http"
 	}
 	var creds *credentials.Credentials
-	switch strings.ToUpper(config.Signature) {
-	case "S3V4":
+	switch config.Signature {
+	case SignatureV4:
 		// if Signature version '4' use NewV4 directly.
 		creds = credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
-	case "S3V2":
+	case SignatureV2:
 		// if Signature version '2' use NewV2 directly.
 		creds = credentials.NewStaticV2(config.AccessKey, config.SecretKey, "")
 	default:
@@ -73,13 +73,8 @@ func newClient(ctx context.Context, endpoint string, config Config) (*minio.Clie
 
 	}
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				cancelFn()
-				return
-			}
-		}
+		<-ctx.Done()
+		cancelFn()
 	}()
 	clnt.SetAppInfo("confess", pkg.Version)
 	return clnt, nil

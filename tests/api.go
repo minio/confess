@@ -18,9 +18,10 @@ package tests
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
+	"sync/atomic"
 
-	"github.com/minio/confess/stats"
 	"github.com/minio/minio-go/v7"
 )
 
@@ -28,25 +29,47 @@ var (
 	errNilClient = errors.New("client is nil")
 )
 
+// Stats denotes the statistical information on the API requests made.
+type Stats struct {
+	TotalCount   atomic.Int64
+	SuccessCount atomic.Int64
+}
+
+func (stats *Stats) increment(success bool) {
+	stats.TotalCount.Add(1)
+	if success {
+		stats.SuccessCount.Add(1)
+	}
+}
+
+// Info returns the stat info.
+func (stats *Stats) Info() (total, success int64) {
+	return stats.TotalCount.Load(), stats.SuccessCount.Load()
+}
+
 type putConfig struct {
 	client     *minio.Client
 	bucketName string
 	objectName string
 	size       int64
+	reader     io.Reader
 	opts       minio.PutObjectOptions
 }
 
-func put(ctx context.Context, config putConfig, stats *stats.APIStats) (info minio.UploadInfo, err error) {
+func put(ctx context.Context, config putConfig, stats *Stats) (info minio.UploadInfo, err error) {
 	defer func() {
-		stats.IncrementStats(&stats.Puts, err == nil)
+		stats.increment(err == nil)
 	}()
 	if config.client == nil {
 		err = errNilClient
 		return
 	}
-	reader := reader(config.size)
-	defer reader.Close()
-	return config.client.PutObject(ctx, config.bucketName, config.objectName, reader, config.size, config.opts)
+	if config.reader == nil {
+		reader := reader(config.size)
+		defer reader.Close()
+		config.reader = reader
+	}
+	return config.client.PutObject(ctx, config.bucketName, config.objectName, config.reader, config.size, config.opts)
 }
 
 type listConfig struct {
@@ -55,9 +78,9 @@ type listConfig struct {
 	opts       minio.ListObjectsOptions
 }
 
-func list(ctx context.Context, config listConfig, stats *stats.APIStats) (objInfo []minio.ObjectInfo, err error) {
+func list(ctx context.Context, config listConfig, stats *Stats) (objInfo []minio.ObjectInfo, err error) {
 	defer func() {
-		stats.IncrementStats(&stats.Lists, err == nil)
+		stats.increment(err == nil)
 	}()
 	if config.client == nil {
 		err = errNilClient
@@ -80,15 +103,33 @@ type statConfig struct {
 	opts       minio.StatObjectOptions
 }
 
-func stat(ctx context.Context, config statConfig, stats *stats.APIStats) (info minio.ObjectInfo, err error) {
+func stat(ctx context.Context, config statConfig, stats *Stats) (info minio.ObjectInfo, err error) {
 	defer func() {
-		stats.IncrementStats(&stats.Heads, err == nil)
+		stats.increment(err == nil)
 	}()
 	if config.client == nil {
 		err = errNilClient
 		return
 	}
 	return config.client.StatObject(ctx, config.bucketName, config.objectName, config.opts)
+}
+
+type getConfig struct {
+	client     *minio.Client
+	bucketName string
+	objectName string
+	opts       minio.GetObjectOptions
+}
+
+func get(ctx context.Context, config getConfig, stats *Stats) (object *minio.Object, err error) {
+	defer func() {
+		stats.increment(err == nil)
+	}()
+	if config.client == nil {
+		err = errNilClient
+		return
+	}
+	return config.client.GetObject(ctx, config.bucketName, config.objectName, config.opts)
 }
 
 type removeObjectsConfig struct {
@@ -98,7 +139,7 @@ type removeObjectsConfig struct {
 	listOpts   minio.ListObjectsOptions
 }
 
-func removeObjects(ctx context.Context, config removeObjectsConfig, stats *stats.APIStats) (err error) {
+func removeObjects(ctx context.Context, config removeObjectsConfig, stats *Stats) (err error) {
 	objects, err := list(ctx, listConfig{
 		client:     config.client,
 		bucketName: config.bucketName,
@@ -112,11 +153,15 @@ func removeObjects(ctx context.Context, config removeObjectsConfig, stats *stats
 		err = config.client.RemoveObject(ctx, config.bucketName, object.Key, minio.RemoveObjectOptions{})
 		if err != nil {
 			removeErrFound = true
-			if err = log(ctx, config.logFile, "", config.client.EndpointURL().String(), "Failed to remove "+object.Key+", error: "+err.Error()); err != nil {
+			if err = log(ctx,
+				config.logFile,
+				"",
+				config.client.EndpointURL().String(),
+				"Failed to remove "+object.Key+", error: "+err.Error()); err != nil {
 				return
 			}
 		}
-		stats.IncrementStats(&stats.Deletes, err == nil)
+		stats.increment(err == nil)
 	}
 	if len(objects) > 0 && removeErrFound {
 		return errors.New("unable to remove few objects")

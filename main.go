@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -55,6 +56,24 @@ func init() {
 	}
 }
 
+// Set implements the cli.Generic interface for the type Signature.
+func (s Signature) Set(value string) error {
+	switch strings.ToUpper(value) {
+	case "S3V4":
+		s = SignatureV4
+	case "S3V2":
+		s = SignatureV2
+	default:
+		return errors.New("unknown signature method. please use s3v4 or s3v2")
+	}
+	return nil
+}
+
+// String implements the cli.Generic interface for the type Signature.
+func (s Signature) String() string {
+	return string(s)
+}
+
 func main() {
 	cli.VersionPrinter = func(c *cli.Context) {
 		io.Copy(c.App.Writer, versionBanner(c))
@@ -89,10 +108,10 @@ func main() {
 			Usage:  "specify a custom region",
 			EnvVar: envPrefix + "REGION",
 		},
-		cli.StringFlag{
+		cli.GenericFlag{
 			Name:   "signature",
 			Usage:  "Specify a signature method. Supported values are s3v2, s3v4",
-			Value:  "s3v4",
+			Value:  SignatureV4,
 			EnvVar: envPrefix + "SIGNATURE",
 			Hidden: true,
 		},
@@ -110,7 +129,7 @@ func main() {
 			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
 			Value: 30 * time.Minute,
 		},
-		cli.IntFlag{
+		cli.Int64Flag{
 			Name:  "fail-after, f",
 			Usage: "fail after n errors. Defaults to 100",
 			Value: 100,
@@ -142,10 +161,10 @@ func versionBanner(c *cli.Context) io.Reader {
 	version := strings.ReplaceAll(buildInfo["vcs.time"], ":", "-")
 	revision := buildInfo["vcs.revision"]
 
-	fmt.Fprintln(banner, Bold("%s version %s (commit-id=%s)", c.App.Name, version, revision))
-	fmt.Fprintln(banner, Blue("Runtime:")+Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
-	fmt.Fprintln(banner, Blue("License:")+Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
-	fmt.Fprintln(banner, Blue("Copyright:")+Bold(" 2022 MinIO, Inc."))
+	fmt.Fprintln(banner, color.HiWhiteString("%s version %s (commit-id=%s)", c.App.Name, version, revision))
+	fmt.Fprintln(banner, color.BlueString("Runtime:")+color.HiWhiteString(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	fmt.Fprintln(banner, color.BlueString("License:")+color.HiWhiteString(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
+	fmt.Fprintln(banner, color.BlueString("Copyright:")+color.HiWhiteString(" 2022 MinIO, Inc."))
 	return strings.NewReader(banner.String())
 }
 
@@ -168,8 +187,9 @@ func confessMain(c *cli.Context) {
 	accessKey := c.String("access-key")
 	secretKey := c.String("secret-key")
 	insecure := c.Bool("insecure")
+	failAfter := c.Int64("fail-after")
 	region := c.String("region")
-	signature := c.String("signature")
+	signature := c.Generic("signature")
 	bucket := c.String("bucket")
 	outputFile := c.String("output")
 	duration := c.Duration("duration")
@@ -178,13 +198,11 @@ func confessMain(c *cli.Context) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGSEGV)
 
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		s := <-sigs
 		console.Printf(color.RedString("\nExiting on signal %v; %#v\n\n", s.String(), s))
 		cancel()
-		<-time.After(1 * time.Second)
-		os.Exit(1)
 	}()
 
 	executor, err := NewExecutor(ctx, Config{
@@ -193,10 +211,11 @@ func confessMain(c *cli.Context) {
 		SecretKey:  secretKey,
 		Insecure:   insecure,
 		Region:     region,
-		Signature:  signature,
+		Signature:  signature.(Signature),
 		Bucket:     bucket,
 		OutputFile: outputFile,
 		Duration:   duration,
+		FailAfter:  failAfter,
 	})
 	if err != nil {
 		console.Fatalln(err)
@@ -214,19 +233,21 @@ func confessMain(c *cli.Context) {
 		}
 	}()
 
-	// run tests
+	// run tests.
 	executor.ExecuteTests(ctx, []Test{
 		&tests.PutListTest{},
 		&tests.PutStatTest{},
+		&tests.PutGetTest{},
 		// new tests can be added here...
 	}, teaProgram)
 
-	teaProgram.Send(progressNotification{
+	// tests completed.
+	teaProgram.Send(notification{
 		done: true,
 	})
-	wg.Wait()
 
-	fmt.Printf("%s \n", color.HiWhiteString(" *** Total Operations Succeeded: %v; Total operations failed: %v *** \n", executor.Stats.Success, executor.Stats.Total-executor.Stats.Success))
+	// wait for completion.
+	wg.Wait()
 
 	return
 }

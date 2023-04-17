@@ -17,72 +17,49 @@ package main
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fatih/color"
-	"github.com/minio/confess/stats"
+	"github.com/minio/confess/tests"
 )
 
-const (
-	padding = 1
-	tick    = "✔"
-	cross   = "✗"
-)
+const padding = 1
 
 var baseStyle = lipgloss.NewStyle().
-	BorderStyle(lipgloss.NormalBorder()).
-	BorderForeground(lipgloss.Color("240"))
-
-type progressLog struct {
-	log  string
-	done bool
-	err  error
-}
-
-type progressNotification struct {
-	log          string
-	progressLogs []progressLog
-	done         bool
-	err          error
-}
+	BorderStyle(lipgloss.RoundedBorder()).
+	BorderForeground(lipgloss.Color("FCFFE7"))
 
 type progressModel struct {
-	spinner      spinner.Model
-	stats        *stats.APIStats
-	table        table.Model
-	progressLogs []progressLog
-	logs         []string
-	errLogs      []string
-	done         bool
+	stats     *tests.Stats
+	errLogs   []string
+	done      bool
+	startTime time.Time
+	table     table.Model
 }
 
-func newProgressModel(stats *stats.APIStats) *progressModel {
+func newProgressModel(stats *tests.Stats) *progressModel {
 	progressM := &progressModel{}
-	progressM.spinner = spinner.New()
-	progressM.spinner.Spinner = spinner.Meter
-	progressM.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#E7B10A"))
 	progressM.stats = stats
+	progressM.startTime = time.Now()
 
 	columns := []table.Column{
-		{Title: "API", Width: 10},
-		{Title: "TOTAL", Width: 10},
-		{Title: "SUCCESS", Width: 10},
+		{Title: "Total Operations", Width: 20},
+		{Title: "Succeeded", Width: 10},
+		{Title: "Failed", Width: 10},
+		{Title: "Duration", Width: 10},
 	}
 	t := table.New(
 		table.WithColumns(columns),
 		table.WithFocused(false),
-		table.WithHeight(4),
+		table.WithHeight(1),
 	)
 	s := table.Styles{
-		Header: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#576CBC")).Padding(0, 1),
-		Cell:   lipgloss.NewStyle().Padding(0, 1),
+		Header: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F99417")).Padding(0, 1),
+		Cell:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#04B575")).Padding(0, 1),
 	}
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
@@ -96,6 +73,20 @@ func newProgressModel(stats *stats.APIStats) *progressModel {
 	return progressM
 }
 
+type notification struct {
+	log  string
+	done bool
+	err  error
+}
+
+type TickMsg time.Time
+
+func tickEvery() tea.Cmd {
+	return tea.Every(time.Millisecond, func(t time.Time) tea.Msg {
+		return TickMsg(t)
+	})
+}
+
 func finalPause() tea.Cmd {
 	return tea.Tick(time.Millisecond*750, func(_ time.Time) tea.Msg {
 		return nil
@@ -103,7 +94,7 @@ func finalPause() tea.Cmd {
 }
 
 func (m progressModel) Init() tea.Cmd {
-	return m.spinner.Tick
+	return tickEvery()
 }
 
 func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -117,87 +108,49 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
-
-	case progressNotification:
-		if msg.log != "" {
-			if m.logs == nil {
-				m.logs = []string{msg.log}
-			} else {
-				m.logs = append(m.logs, msg.log)
-			}
-		}
-		if len(msg.progressLogs) > 0 {
-			m.progressLogs = msg.progressLogs
-		}
+	case TickMsg:
+		var cmd tea.Cmd
+		var cmds []tea.Cmd
+		m.table, cmd = m.table.Update(msg)
+		cmds = append(cmds, cmd, tickEvery())
+		return m, tea.Batch(cmds...)
+	case notification:
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(msg)
 		if msg.err != nil {
 			m.errLogs = append(m.errLogs, msg.err.Error())
 		}
-		var cmd tea.Cmd
-		m.table, cmd = m.table.Update(msg)
-		cmds := []tea.Cmd{
-			cmd,
-		}
 		if msg.done {
 			m.done = msg.done
-			cmds = append(cmds, tea.Sequence(finalPause(), tea.Quit))
+			return m, tea.Sequence(finalPause(), tea.Quit)
 		}
-
-		return m, tea.Batch(cmds...)
-
-	// FrameMsg is sent when the progress bar wants to animate itself
-	case progress.FrameMsg:
-		return m, nil
-
+		return m, cmd
 	default:
-		var sCmd, tCmd tea.Cmd
-		m.spinner, sCmd = m.spinner.Update(msg)
-		m.table, tCmd = m.table.Update(msg)
-		cmds := []tea.Cmd{
-			sCmd,
-			tCmd,
-		}
-		return m, tea.Batch(cmds...)
+		return m, nil
 	}
 }
 
 func (m progressModel) View() (str string) {
-
+	totalCount, successCount := m.stats.Info()
+	duration := time.Since(m.startTime)
 	rows := []table.Row{
-		{"PUT", strconv.Itoa(m.stats.Puts.TotalCount), strconv.Itoa(m.stats.Puts.SuccessCount)},
-		{"HEAD", strconv.Itoa(m.stats.Heads.TotalCount), strconv.Itoa(m.stats.Heads.SuccessCount)},
-		{"LIST", strconv.Itoa(m.stats.Lists.TotalCount), strconv.Itoa(m.stats.Lists.SuccessCount)},
-		{"DELETE", strconv.Itoa(m.stats.Deletes.TotalCount), strconv.Itoa(m.stats.Deletes.SuccessCount)},
+		{
+			color.HiWhiteString("%d", totalCount),
+			color.HiWhiteString("%d", successCount),
+			color.HiRedString("%d", totalCount-successCount),
+			color.HiWhiteString(duration.Round(time.Second).String()),
+		},
 	}
 	m.table.SetRows(rows)
-
-	str += "\n" + baseStyle.Render(m.table.View()) + "\n\n"
-
 	pad := strings.Repeat(" ", padding)
-	for i := range m.progressLogs {
-		if m.progressLogs[i].done {
-			symbol := tick
-			if m.progressLogs[i].err != nil {
-				symbol = cross
-			}
-			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString(m.progressLogs[i].log), m.spinner.Style.Render(symbol))
-		} else {
-			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString(m.progressLogs[i].log), m.spinner.View())
-		}
-		if i == len(m.progressLogs)-1 {
-			str += "\n"
-		}
-	}
-	for i := range m.logs {
-		str += pad + fmt.Sprintln(color.HiYellowString("%s", m.logs[i]))
-		if i == len(m.logs)-1 {
-			str += "\n"
-		}
-	}
+	str += pad + "\n" + baseStyle.Render(m.table.View()) + "\n\n"
+
 	for i := range m.errLogs {
 		str += pad + fmt.Sprintln(color.HiRedString("%s", m.errLogs[i]))
 		if i == len(m.errLogs)-1 {
 			str += "\n"
 		}
 	}
+
 	return str + pad
 }

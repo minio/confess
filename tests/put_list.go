@@ -1,4 +1,4 @@
-// Copyright (c) 2022 MinIO, Inc.
+// Copyright (c) 2023 MinIO, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -24,30 +24,34 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/confess/stats"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
 )
 
 const objectCountForPutListTest = 50
 
+// PutListTest uploads the objects using a random client and then
+// Lists the objects from each node to verify if the list output
+// is consistent accross nodes.
 type PutListTest struct {
 	clients             []*minio.Client
 	logFile             *os.File
 	bucket              string
 	uploadedObjectNames map[string]struct{}
-	apiStats            *stats.APIStats
+	apiStats            *Stats
 }
 
 func (t *PutListTest) bucketName() string {
 	return t.bucket
 }
 
+// Name - name of the test.
 func (t *PutListTest) Name() string {
 	return "PutList"
 }
 
-func (t *PutListTest) Init(ctx context.Context, config Config, stats *stats.APIStats) error {
+// Init initialized the test.
+func (t *PutListTest) Init(ctx context.Context, config Config, stats *Stats) error {
 	t.clients = config.Clients
 	t.logFile = config.LogFile
 	t.bucket = config.Bucket
@@ -56,7 +60,8 @@ func (t *PutListTest) Init(ctx context.Context, config Config, stats *stats.APIS
 	return nil
 }
 
-func (t *PutListTest) PreRun(ctx context.Context) error {
+// Setup prepares the test by uploading the objects to the test bucket.
+func (t *PutListTest) Setup(ctx context.Context) error {
 	client, err := utils.GetRandomClient(t.clients)
 	if err != nil {
 		return err
@@ -80,6 +85,8 @@ func (t *PutListTest) PreRun(ctx context.Context) error {
 	return nil
 }
 
+// Run executes the test by verifying if the list output is
+// consistent accross the nodes.
 func (t *PutListTest) Run(ctx context.Context) error {
 	var offlineNodes int
 	for i := 0; i < len(t.clients); i++ {
@@ -125,7 +132,8 @@ func (t *PutListTest) Run(ctx context.Context) error {
 	return nil
 }
 
-func (t *PutListTest) PostRun(ctx context.Context) error {
+// TearDown removes the uploaded objects from the test bucket.
+func (t *PutListTest) TearDown(ctx context.Context) error {
 	client, err := utils.GetRandomClient(t.clients)
 	if err != nil {
 		return err
