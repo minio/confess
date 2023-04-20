@@ -33,9 +33,10 @@ func init() {
 
 // Config represents the test config
 type Config struct {
-	Clients []*minio.Client
-	Bucket  string
-	LogFile *os.File
+	Clients     []*minio.Client
+	Bucket      string
+	LogFile     *os.File
+	Concurrency int
 }
 
 func newRandomReader(seed, size int64) io.Reader {

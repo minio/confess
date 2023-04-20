@@ -23,11 +23,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
+	xnet "github.com/minio/pkg/net"
 )
 
 const objectCountForPutGetTest = 50
@@ -36,11 +39,20 @@ const objectCountForPutGetTest = 50
 // Gets the objects from each node to verify if the get output
 // is consistent accross nodes.
 type PutGetTest struct {
-	clients           []*minio.Client
-	logFile           *os.File
-	bucket            string
-	objectsWithSha256 map[string][]byte
-	apiStats          *Stats
+	clients             []*minio.Client
+	logFile             *os.File
+	bucket              string
+	objectsWithMetaData sync.Map
+	apiStats            *Stats
+	concurrency         int
+}
+
+// metaData to store the uploaded object's info
+// which will be used for verification.
+type metaData struct {
+	sha256 []byte
+	size   int64
+	etag   string
 }
 
 func (t *PutGetTest) bucketName() string {
@@ -57,76 +69,100 @@ func (t *PutGetTest) Init(ctx context.Context, config Config, stats *Stats) erro
 	t.clients = config.Clients
 	t.logFile = config.LogFile
 	t.bucket = config.Bucket
-	t.objectsWithSha256 = make(map[string][]byte, objectCountForPutGetTest)
+	t.objectsWithMetaData = sync.Map{}
 	t.apiStats = stats
+	t.concurrency = config.Concurrency
 	return nil
 }
 
 // Setup prepares the test by uploading the objects to the test bucket.
 func (t *PutGetTest) Setup(ctx context.Context) error {
-	client, err := utils.GetRandomClient(t.clients)
-	if err != nil {
-		return err
-	}
-	for i := 0; i < objectCountForPutGetTest; i++ {
-		object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), i)
-		hasher := sha256.New()
-		tr := io.TeeReader(reader(humanize.MiByte*5), hasher)
-		if _, err := put(ctx, putConfig{
-			client:     client,
-			bucketName: t.bucket,
-			objectName: object,
-			reader:     tr,
-			opts:       minio.PutObjectOptions{},
-		}, t.apiStats); err != nil {
-			if err := log(ctx, t.logFile, t.Name(), client.EndpointURL().String(), fmt.Sprintf("unable to put the object %s; %v", object, err)); err != nil {
+	return runFn(ctx,
+		objectCountForPutGetTest,
+		t.concurrency,
+		func(ctx context.Context, index int) error {
+			client, err := utils.GetRandomClient(t.clients)
+			if err != nil {
 				return err
 			}
-		} else {
-			t.objectsWithSha256[object] = hasher.Sum(nil)
-		}
-	}
-	return nil
+			object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), index)
+			hasher := sha256.New()
+			tr := io.TeeReader(reader(humanize.MiByte*5), hasher)
+			if objectInfo, err := put(ctx, putConfig{
+				client:     client,
+				bucketName: t.bucket,
+				objectName: object,
+				reader:     tr,
+				opts:       minio.PutObjectOptions{},
+			}, t.apiStats); err != nil {
+				if err := log(ctx,
+					t.logFile,
+					t.Name(),
+					client.EndpointURL().String(),
+					fmt.Sprintf("unable to put the object %s; %v", object, err),
+				); err != nil {
+					return err
+				}
+			} else {
+				t.objectsWithMetaData.Store(object, metaData{
+					sha256: hasher.Sum(nil),
+					size:   objectInfo.Size,
+					etag:   objectInfo.ETag,
+				})
+			}
+			return nil
+		},
+	)
 }
 
 // Run executes the test by verifying if the get output is
 // consistent accross the nodes.
 func (t *PutGetTest) Run(ctx context.Context) error {
-	var offlineNodes int
-	var errFound bool
-	for i := 0; i < len(t.clients); i++ {
-		if t.clients[i].IsOffline() {
-			offlineNodes++
-			if err := log(
-				ctx,
-				t.logFile,
-				t.Name(),
-				t.clients[i].EndpointURL().String(),
-				fmt.Sprintf("the node %s is offline", t.clients[i].EndpointURL().String()),
-			); err != nil {
-				return err
+	var offlineNodes atomic.Int64
+	var errFound atomic.Bool
+	if err := runFn(ctx,
+		len(t.clients),
+		t.concurrency,
+		func(ctx context.Context, index int) error {
+			if t.clients[index].IsOffline() {
+				offlineNodes.Add(1)
+				if err := log(
+					ctx,
+					t.logFile,
+					t.Name(),
+					t.clients[index].EndpointURL().String(),
+					fmt.Sprintf("the node %s is offline", t.clients[index].EndpointURL().String()),
+				); err != nil {
+					return err
+				}
+				return nil
 			}
-			continue
-		}
-		if err := t.verify(ctx, t.clients[i]); err != nil {
-			if err := log(
-				ctx,
-				t.logFile,
-				t.Name(),
-				t.clients[i].EndpointURL().String(),
-				fmt.Sprintf("unable to verify %s test; %v", t.Name(), err),
-			); err != nil {
-				return err
+			if err := t.verify(ctx, t.clients[index]); err != nil {
+				if !xnet.IsNetworkOrHostDown(err, true) {
+					errFound.CompareAndSwap(false, true)
+				} else {
+					offlineNodes.Add(1)
+				}
+				if err := log(
+					ctx,
+					t.logFile,
+					t.Name(),
+					t.clients[index].EndpointURL().String(),
+					fmt.Sprintf("unable to verify %s test; %v", t.Name(), err),
+				); err != nil {
+					return err
+				}
 			}
-			errFound = true
-		}
-
+			return nil
+		},
+	); err != nil {
+		return nil
 	}
-	if offlineNodes == len(t.clients) {
+	if offlineNodes.Load() == int64(len(t.clients)) {
 		return errors.New("all nodes are offline")
 	}
-	if errFound {
-		return errors.New("get inconstent across nodes")
+	if errFound.Load() {
+		return errors.New("get inconsistent across nodes")
 	}
 	return nil
 }
@@ -148,30 +184,43 @@ func (t *PutGetTest) TearDown(ctx context.Context) error {
 	}, t.apiStats)
 }
 
-func (t *PutGetTest) verify(ctx context.Context, client *minio.Client) error {
-	for objectName, sha256sum := range t.objectsWithSha256 {
-		object, err := get(ctx, getConfig{
+func (t *PutGetTest) verify(ctx context.Context, client *minio.Client) (err error) {
+	t.objectsWithMetaData.Range(func(key, value any) bool {
+		objectName := key.(string)
+		savedMetaData := value.(metaData)
+		var object *minio.Object
+		object, err = get(ctx, getConfig{
 			client:     client,
 			bucketName: t.bucket,
 			objectName: objectName,
 			opts:       minio.GetObjectOptions{},
 		}, t.apiStats)
 		if err != nil {
-			return err
+			return false
 		}
-		// TODO: Verify ETAG
-		_, err = object.Stat()
+		var objectInfo minio.ObjectInfo
+		objectInfo, err = object.Stat()
 		if err != nil {
-			return err
+			return false
+		}
+		if objectInfo.ETag != savedMetaData.etag {
+			err = fmt.Errorf("ETag mismatch for object %s", objectName)
+			return false
+		}
+		if objectInfo.Size != savedMetaData.size {
+			err = fmt.Errorf("size mismatch for object %s", objectName)
+			return false
 		}
 		hasher := sha256.New()
 		_, err = io.Copy(hasher, object)
 		if err != nil {
-			return err
+			return false
 		}
-		if !bytes.Equal(sha256sum, hasher.Sum(nil)) {
-			return fmt.Errorf("sha256 mismatch for object %s", objectName)
+		if !bytes.Equal(savedMetaData.sha256, hasher.Sum(nil)) {
+			err = fmt.Errorf("sha256 mismatch for object %s", objectName)
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return
 }

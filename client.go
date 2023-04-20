@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -43,16 +42,9 @@ func newClient(ctx context.Context, endpoint string, config Config) (*minio.Clie
 	if targetURL.Scheme == "" {
 		targetURL.Scheme = "http"
 	}
-	var creds *credentials.Credentials
-	switch config.Signature {
-	case SignatureV4:
-		// if Signature version '4' use NewV4 directly.
-		creds = credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
-	case SignatureV2:
-		// if Signature version '2' use NewV2 directly.
+	creds := credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
+	if config.UseSignV2 {
 		creds = credentials.NewStaticV2(config.AccessKey, config.SecretKey, "")
-	default:
-		return nil, errors.New("unknown signature method")
 	}
 	isSecured := targetURL.Scheme == "https"
 	clnt, err := minio.New(targetURL.Host, &minio.Options{

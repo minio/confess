@@ -25,7 +25,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/minio/confess/tests"
+	testspkg "github.com/minio/confess/tests"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
@@ -34,37 +34,19 @@ import (
 
 var slashSeparator = "/"
 
-// Signature denotes the s3 signature type.
-type Signature string
-
-const (
-	// SignatureV4 denotes s3v4 algorithm
-	SignatureV4 Signature = "s3v4"
-	// SignatureV2 denotes s3v2 algorithm
-	SignatureV2 Signature = "s3v2"
-)
-
 // Config represents the confess executor configuration.
 type Config struct {
-	Hosts      []string      `json:"hosts"`
-	AccessKey  string        `json:"accessKey"`
-	SecretKey  string        `json:"secretKey"`
-	Insecure   bool          `json:"insecure,omitempty"`
-	Region     string        `json:"region,omitempty"`
-	Signature  Signature     `json:"signature"`
-	Bucket     string        `json:"bucket"`
-	OutputFile string        `json:"outputFile"`
-	FailAfter  int64         `json:"failAfter"`
-	Duration   time.Duration `json:"duration"`
-}
-
-// Test interface defines the test.
-type Test interface {
-	Name() string
-	Init(ctx context.Context, config tests.Config, stats *tests.Stats) error
-	Setup(ctx context.Context) error
-	Run(ctx context.Context) error
-	TearDown(ctx context.Context) error
+	Hosts       []string      `json:"hosts"`
+	AccessKey   string        `json:"accessKey"`
+	SecretKey   string        `json:"secretKey"`
+	Insecure    bool          `json:"insecure,omitempty"`
+	Region      string        `json:"region,omitempty"`
+	UseSignV2   bool          `json:"useSignV2"`
+	Bucket      string        `json:"bucket"`
+	OutputFile  string        `json:"outputFile"`
+	FailAfter   int64         `json:"failAfter"`
+	Duration    time.Duration `json:"duration"`
+	Concurrency int           `json:"concurrency"`
 }
 
 // Validate - validates the config provided.
@@ -87,9 +69,10 @@ type Executor struct {
 	Clients              []*minio.Client
 	EnableVersionedTests bool
 	LogFile              string
-	Stats                *tests.Stats
+	Stats                *testspkg.Stats
 	Duration             time.Duration
 	FailAfter            int64
+	Concurrency          int
 	sLock                sync.Mutex
 }
 
@@ -114,7 +97,7 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 				console.Fatalln(fmt.Errorf("unable to parse input arg %s: %s", patterns, perr))
 			}
 			for _, values := range patterns.Expand() {
-				endpoints = append(endpoints, strings.Join(values, ""))
+				endpoints = append(endpoints, values...)
 			}
 		}
 	}
@@ -150,12 +133,13 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 		LogFile:              config.OutputFile,
 		Duration:             config.Duration,
 		FailAfter:            config.FailAfter,
-		Stats:                &tests.Stats{},
+		Concurrency:          config.Concurrency,
+		Stats:                &testspkg.Stats{},
 	}, nil
 }
 
 // Execute Tests will execute the tests parallelly and send the progress to the TUI.
-func (e *Executor) ExecuteTests(ctx context.Context, tests []Test, teaProgram *tea.Program) error {
+func (e *Executor) ExecuteTests(ctx context.Context, tests []testspkg.Test, teaProgram *tea.Program) error {
 	f, err := os.OpenFile(e.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("unable to open the log file %s; %v", e.LogFile, err)
@@ -189,7 +173,7 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []Test, teaProgram *t
 	var wg sync.WaitGroup
 	for i := range tests {
 		wg.Add(1)
-		go func(test Test) {
+		go func(test testspkg.Test) {
 			defer wg.Done()
 			if err = e.executeTest(ctx, test, f); err != nil {
 				teaProgram.Send(notification{
@@ -203,17 +187,18 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []Test, teaProgram *t
 	return nil
 }
 
-func (e *Executor) executeTest(ctx context.Context, test Test, logFile *os.File) (err error) {
+func (e *Executor) executeTest(ctx context.Context, test testspkg.Test, logFile *os.File) (err error) {
 	defer func() {
 		err = test.TearDown(ctx)
 		if err != nil {
 			err = fmt.Errorf("Error while tearing down '%s' test; %v", test.Name(), err)
 		}
 	}()
-	if err := test.Init(ctx, tests.Config{
-		Clients: e.Clients,
-		Bucket:  e.Bucket,
-		LogFile: logFile,
+	if err := test.Init(ctx, testspkg.Config{
+		Clients:     e.Clients,
+		Bucket:      e.Bucket,
+		LogFile:     logFile,
+		Concurrency: e.Concurrency,
 	}, e.Stats); err != nil {
 		return fmt.Errorf("Error while initializing '%s' test; %v", test.Name(), err)
 	}

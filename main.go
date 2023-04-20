@@ -17,7 +17,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -56,24 +55,6 @@ func init() {
 	}
 }
 
-// Set implements the cli.Generic interface for the type Signature.
-func (s Signature) Set(value string) error {
-	switch strings.ToUpper(value) {
-	case "S3V4":
-		s = SignatureV4
-	case "S3V2":
-		s = SignatureV2
-	default:
-		return errors.New("unknown signature method. please use s3v4 or s3v2")
-	}
-	return nil
-}
-
-// String implements the cli.Generic interface for the type Signature.
-func (s Signature) String() string {
-	return string(s)
-}
-
 func main() {
 	cli.VersionPrinter = func(c *cli.Context) {
 		io.Copy(c.App.Writer, versionBanner(c))
@@ -108,12 +89,10 @@ func main() {
 			Usage:  "specify a custom region",
 			EnvVar: envPrefix + "REGION",
 		},
-		cli.GenericFlag{
-			Name:   "signature",
-			Usage:  "Specify a signature method. Supported values are s3v2, s3v4",
-			Value:  SignatureV4,
-			EnvVar: envPrefix + "SIGNATURE",
-			Hidden: true,
+		cli.BoolFlag{
+			Name:   "use-signv2",
+			Usage:  "Use s3v2 as the signature method",
+			EnvVar: envPrefix + "USE_SIGNV2",
 		},
 		cli.StringFlag{
 			Name:   "bucket",
@@ -133,6 +112,11 @@ func main() {
 			Name:  "fail-after, f",
 			Usage: "fail after n errors. Defaults to 100",
 			Value: 100,
+		},
+		cli.IntFlag{
+			Name:  "test-concurrency",
+			Usage: "Number of concurrent threads for each test in the test suite",
+			Value: 10,
 		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
@@ -189,10 +173,11 @@ func confessMain(c *cli.Context) {
 	insecure := c.Bool("insecure")
 	failAfter := c.Int64("fail-after")
 	region := c.String("region")
-	signature := c.Generic("signature")
+	useSignV2 := c.Bool("use-signv2")
 	bucket := c.String("bucket")
 	outputFile := c.String("output")
 	duration := c.Duration("duration")
+	concurrency := c.Int("test-concurrency")
 	hosts := c.Args()
 
 	sigs := make(chan os.Signal, 1)
@@ -206,16 +191,17 @@ func confessMain(c *cli.Context) {
 	}()
 
 	executor, err := NewExecutor(ctx, Config{
-		Hosts:      hosts,
-		AccessKey:  accessKey,
-		SecretKey:  secretKey,
-		Insecure:   insecure,
-		Region:     region,
-		Signature:  signature.(Signature),
-		Bucket:     bucket,
-		OutputFile: outputFile,
-		Duration:   duration,
-		FailAfter:  failAfter,
+		Hosts:       hosts,
+		AccessKey:   accessKey,
+		SecretKey:   secretKey,
+		Insecure:    insecure,
+		Region:      region,
+		UseSignV2:   useSignV2,
+		Bucket:      bucket,
+		OutputFile:  outputFile,
+		Duration:    duration,
+		FailAfter:   failAfter,
+		Concurrency: concurrency,
 	})
 	if err != nil {
 		console.Fatalln(err)
@@ -234,7 +220,7 @@ func confessMain(c *cli.Context) {
 	}()
 
 	// run tests.
-	executor.ExecuteTests(ctx, []Test{
+	executor.ExecuteTests(ctx, []tests.Test{
 		&tests.PutListTest{},
 		&tests.PutStatTest{},
 		&tests.PutGetTest{},

@@ -20,11 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
+	xnet "github.com/minio/pkg/net"
 )
 
 const objectCountForPutStatTest = 50
@@ -36,8 +39,9 @@ type PutStatTest struct {
 	clients             []*minio.Client
 	logFile             *os.File
 	bucket              string
-	uploadedObjectNames map[string]struct{}
+	uploadedObjectNames sync.Map
 	apiStats            *Stats
+	concurrency         int
 }
 
 func (t *PutStatTest) bucketName() string {
@@ -54,19 +58,20 @@ func (t *PutStatTest) Init(ctx context.Context, config Config, stats *Stats) err
 	t.clients = config.Clients
 	t.logFile = config.LogFile
 	t.bucket = config.Bucket
-	t.uploadedObjectNames = make(map[string]struct{}, objectCountForPutStatTest)
+	t.uploadedObjectNames = sync.Map{}
 	t.apiStats = stats
+	t.concurrency = config.Concurrency
 	return nil
 }
 
 // Setup prepares the test by uploading the objects to the test bucket.
 func (t *PutStatTest) Setup(ctx context.Context) error {
-	client, err := utils.GetRandomClient(t.clients)
-	if err != nil {
-		return err
-	}
-	for i := 0; i < objectCountForPutStatTest; i++ {
-		object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), i)
+	return runFn(ctx, objectCountForPutStatTest, t.concurrency, func(ctx context.Context, index int) error {
+		client, err := utils.GetRandomClient(t.clients)
+		if err != nil {
+			return err
+		}
+		object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), index)
 		if _, err := put(ctx, putConfig{
 			client:     client,
 			bucketName: t.bucket,
@@ -82,50 +87,56 @@ func (t *PutStatTest) Setup(ctx context.Context) error {
 				return err
 			}
 		} else {
-			t.uploadedObjectNames[object] = struct{}{}
+			t.uploadedObjectNames.Store(object, struct{}{})
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // Run executes the test by verifying if the stat output is
 // consistent accross the nodes.
 func (t *PutStatTest) Run(ctx context.Context) error {
-	var offlineNodes int
-	var errFound bool
-	for i := 0; i < len(t.clients); i++ {
-		if t.clients[i].IsOffline() {
-			offlineNodes++
+	var offlineNodes atomic.Int64
+	var errFound atomic.Bool
+	if err := runFn(ctx, len(t.clients), t.concurrency, func(ctx context.Context, index int) error {
+		if t.clients[index].IsOffline() {
+			offlineNodes.Add(1)
 			if err := log(
 				ctx,
 				t.logFile,
 				t.Name(),
-				t.clients[i].EndpointURL().String(),
-				fmt.Sprintf("the node %s is offline", t.clients[i].EndpointURL().String()),
+				t.clients[index].EndpointURL().String(),
+				fmt.Sprintf("the node %s is offline", t.clients[index].EndpointURL().String()),
 			); err != nil {
 				return err
 			}
-			continue
+			return nil
 		}
-		if err := t.verify(ctx, t.clients[i]); err != nil {
+		if err := t.verify(ctx, t.clients[index]); err != nil {
+			if !xnet.IsNetworkOrHostDown(err, true) {
+				errFound.CompareAndSwap(false, true)
+			} else {
+				offlineNodes.Add(1)
+			}
 			if err := log(
 				ctx,
 				t.logFile,
 				t.Name(),
-				t.clients[i].EndpointURL().String(),
+				t.clients[index].EndpointURL().String(),
 				fmt.Sprintf("unable to verify %s; %v", t.Name(), err),
 			); err != nil {
 				return err
 			}
-			errFound = true
 		}
-
+		return nil
+	}); err != nil {
+		return err
 	}
-	if offlineNodes == len(t.clients) {
+	if offlineNodes.Load() == int64(len(t.clients)) {
 		return errors.New("all nodes are offline")
 	}
-	if errFound {
-		return errors.New("stat inconstent across nodes")
+	if errFound.Load() {
+		return errors.New("stat inconsistent across nodes")
 	}
 	return nil
 }
@@ -147,16 +158,16 @@ func (t *PutStatTest) TearDown(ctx context.Context) error {
 	}, t.apiStats)
 }
 
-func (t *PutStatTest) verify(ctx context.Context, client *minio.Client) error {
-	for objectName := range t.uploadedObjectNames {
-		if _, err := stat(ctx, statConfig{
+func (t *PutStatTest) verify(ctx context.Context, client *minio.Client) (err error) {
+	t.uploadedObjectNames.Range(func(key, _ any) bool {
+		objectName := key.(string)
+		_, err = stat(ctx, statConfig{
 			client:     client,
 			bucketName: t.bucket,
 			objectName: objectName,
 			opts:       minio.StatObjectOptions{},
-		}, t.apiStats); err != nil {
-			return err
-		}
-	}
-	return nil
+		}, t.apiStats)
+		return err == nil
+	})
+	return
 }
