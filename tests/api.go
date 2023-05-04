@@ -18,8 +18,8 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"os"
 	"sync/atomic"
 
 	"github.com/minio/minio-go/v7"
@@ -33,6 +33,11 @@ var (
 type Stats struct {
 	TotalCount   atomic.Int64
 	SuccessCount atomic.Int64
+}
+
+func (stats *Stats) String() string {
+	total, success := stats.Info()
+	return fmt.Sprintf("Total: %d\nSuccess: %d\nFailed: %d", total, success, total-success)
 }
 
 func (stats *Stats) increment(success bool) {
@@ -58,7 +63,9 @@ type putConfig struct {
 
 func put(ctx context.Context, config putConfig, stats *Stats) (info minio.UploadInfo, err error) {
 	defer func() {
-		stats.increment(err == nil)
+		if !isIgnored(err) {
+			stats.increment(err == nil)
+		}
 	}()
 	if config.client == nil {
 		err = errNilClient
@@ -80,7 +87,9 @@ type listConfig struct {
 
 func list(ctx context.Context, config listConfig, stats *Stats) (objInfo []minio.ObjectInfo, err error) {
 	defer func() {
-		stats.increment(err == nil)
+		if !isIgnored(err) {
+			stats.increment(err == nil)
+		}
 	}()
 	if config.client == nil {
 		err = errNilClient
@@ -105,7 +114,9 @@ type statConfig struct {
 
 func stat(ctx context.Context, config statConfig, stats *Stats) (info minio.ObjectInfo, err error) {
 	defer func() {
-		stats.increment(err == nil)
+		if !isIgnored(err) {
+			stats.increment(err == nil)
+		}
 	}()
 	if config.client == nil {
 		err = errNilClient
@@ -123,7 +134,9 @@ type getConfig struct {
 
 func get(ctx context.Context, config getConfig, stats *Stats) (object *minio.Object, err error) {
 	defer func() {
-		stats.increment(err == nil)
+		if !isIgnored(err) {
+			stats.increment(err == nil)
+		}
 	}()
 	if config.client == nil {
 		err = errNilClient
@@ -135,7 +148,6 @@ func get(ctx context.Context, config getConfig, stats *Stats) (object *minio.Obj
 type removeObjectsConfig struct {
 	client     *minio.Client
 	bucketName string
-	logFile    *os.File
 	listOpts   minio.ListObjectsOptions
 }
 
@@ -148,23 +160,31 @@ func removeObjects(ctx context.Context, config removeObjectsConfig, stats *Stats
 	if err != nil {
 		return err
 	}
-	var removeErrFound bool
 	for _, object := range objects {
-		err = config.client.RemoveObject(ctx, config.bucketName, object.Key, minio.RemoveObjectOptions{})
-		if err != nil {
-			removeErrFound = true
-			if err = log(ctx,
-				config.logFile,
-				"",
-				config.client.EndpointURL().String(),
-				"Failed to remove "+object.Key+", error: "+err.Error()); err != nil {
-				return
-			}
+		if err := removeObject(ctx, removeObjectConfig{
+			client:     config.client,
+			bucketName: config.bucketName,
+			objectKey:  object.Key,
+			removeOpts: minio.RemoveObjectOptions{},
+		}, stats); err != nil {
+			return nil
 		}
-		stats.increment(err == nil)
-	}
-	if len(objects) > 0 && removeErrFound {
-		return errors.New("unable to remove few objects")
 	}
 	return nil
+}
+
+type removeObjectConfig struct {
+	client     *minio.Client
+	bucketName string
+	objectKey  string
+	removeOpts minio.RemoveObjectOptions
+}
+
+func removeObject(ctx context.Context, config removeObjectConfig, stats *Stats) (err error) {
+	defer func() {
+		if !isIgnored(err) {
+			stats.increment(err == nil)
+		}
+	}()
+	return config.client.RemoveObject(ctx, config.bucketName, config.objectKey, config.removeOpts)
 }

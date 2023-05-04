@@ -33,6 +33,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/confess/tests"
+	"github.com/minio/confess/utils"
 	"github.com/minio/pkg/console"
 )
 
@@ -118,6 +119,16 @@ func main() {
 			Usage: "Number of concurrent threads for each test in the test suite",
 			Value: 10,
 		},
+		cli.IntFlag{
+			Name:  "test-objects-count",
+			Usage: "Number of test objects for each test in the test suite",
+			Value: 50,
+		},
+		cli.IntFlag{
+			Name:  "verbosity",
+			Usage: "Set the logging verbosity",
+			Value: 0,
+		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}
@@ -175,10 +186,29 @@ func confessMain(c *cli.Context) {
 	region := c.String("region")
 	useSignV2 := c.Bool("use-signv2")
 	bucket := c.String("bucket")
-	outputFile := c.String("output")
+	outputFileName := c.String("output")
 	duration := c.Duration("duration")
 	concurrency := c.Int("test-concurrency")
+	objectsCount := c.Int("test-objects-count")
+	verbosity := c.Int("verbosity")
 	hosts := c.Args()
+
+	outputFile, err := os.OpenFile(outputFileName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		console.Fatalln("unable to open output file", err)
+	}
+	defer outputFile.Close()
+
+	if _, err := outputFile.WriteString(
+		fmt.Sprintf(
+			"\n****Config****\nHosts: %s\nBucket: %s\nDuration: %s\n**************\n",
+			hosts,
+			bucket,
+			duration.String(),
+		),
+	); err != nil {
+		console.Fatalln("unable to write to output file", err)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGSEGV)
@@ -191,24 +221,25 @@ func confessMain(c *cli.Context) {
 	}()
 
 	executor, err := NewExecutor(ctx, Config{
-		Hosts:       hosts,
-		AccessKey:   accessKey,
-		SecretKey:   secretKey,
-		Insecure:    insecure,
-		Region:      region,
-		UseSignV2:   useSignV2,
-		Bucket:      bucket,
-		OutputFile:  outputFile,
-		Duration:    duration,
-		FailAfter:   failAfter,
-		Concurrency: concurrency,
+		Hosts:        hosts,
+		AccessKey:    accessKey,
+		SecretKey:    secretKey,
+		Insecure:     insecure,
+		Region:       region,
+		UseSignV2:    useSignV2,
+		Bucket:       bucket,
+		Duration:     duration,
+		FailAfter:    failAfter,
+		ObjectsCount: objectsCount,
+		Concurrency:  concurrency,
+		Logger:       utils.NewLogger(outputFile, verbosity),
 	})
 	if err != nil {
 		console.Fatalln(err)
 	}
 
 	var wg sync.WaitGroup
-	m := newProgressModel(executor.Stats)
+	m := newProgressModel(executor.Stats, cancel)
 	teaProgram := tea.NewProgram(m)
 	wg.Add(1)
 	go func() {
@@ -218,6 +249,9 @@ func confessMain(c *cli.Context) {
 			os.Exit(1)
 		}
 	}()
+
+	// Start monitoring nodes health.
+	go executor.MonitorNodeHealth(ctx, teaProgram)
 
 	// run tests.
 	executor.ExecuteTests(ctx, []tests.Test{
@@ -234,6 +268,12 @@ func confessMain(c *cli.Context) {
 
 	// wait for completion.
 	wg.Wait()
+
+	if _, err := outputFile.WriteString(
+		fmt.Sprintf("\n****Summary****\n%s\n**************", executor.Stats.String()),
+	); err != nil {
+		console.Fatalln("unable to write to output file", err)
+	}
 
 	return
 }

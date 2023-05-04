@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,17 +35,18 @@ var slashSeparator = "/"
 
 // Config represents the confess executor configuration.
 type Config struct {
-	Hosts       []string      `json:"hosts"`
-	AccessKey   string        `json:"accessKey"`
-	SecretKey   string        `json:"secretKey"`
-	Insecure    bool          `json:"insecure,omitempty"`
-	Region      string        `json:"region,omitempty"`
-	UseSignV2   bool          `json:"useSignV2"`
-	Bucket      string        `json:"bucket"`
-	OutputFile  string        `json:"outputFile"`
-	FailAfter   int64         `json:"failAfter"`
-	Duration    time.Duration `json:"duration"`
-	Concurrency int           `json:"concurrency"`
+	Hosts        []string      `json:"hosts"`
+	AccessKey    string        `json:"accessKey"`
+	SecretKey    string        `json:"secretKey"`
+	Insecure     bool          `json:"insecure,omitempty"`
+	Region       string        `json:"region,omitempty"`
+	UseSignV2    bool          `json:"useSignV2"`
+	Bucket       string        `json:"bucket"`
+	FailAfter    int64         `json:"failAfter"`
+	Duration     time.Duration `json:"duration"`
+	ObjectsCount int           `json:"objectsCount"`
+	Concurrency  int           `json:"concurrency"`
+	Logger       utils.Logger  `json:"-"`
 }
 
 // Validate - validates the config provided.
@@ -68,11 +68,12 @@ type Executor struct {
 	Bucket               string
 	Clients              []*minio.Client
 	EnableVersionedTests bool
-	LogFile              string
 	Stats                *testspkg.Stats
 	Duration             time.Duration
 	FailAfter            int64
+	ObjectsCount         int
 	Concurrency          int
+	Logger               utils.Logger
 	sLock                sync.Mutex
 }
 
@@ -130,22 +131,23 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 		Bucket:               config.Bucket,
 		Clients:              clients,
 		EnableVersionedTests: versionConfig.Enabled(),
-		LogFile:              config.OutputFile,
 		Duration:             config.Duration,
 		FailAfter:            config.FailAfter,
 		Concurrency:          config.Concurrency,
+		ObjectsCount:         config.ObjectsCount,
+		Logger:               config.Logger,
 		Stats:                &testspkg.Stats{},
 	}, nil
 }
 
 // Execute Tests will execute the tests parallelly and send the progress to the TUI.
 func (e *Executor) ExecuteTests(ctx context.Context, tests []testspkg.Test, teaProgram *tea.Program) error {
-	f, err := os.OpenFile(e.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("unable to open the log file %s; %v", e.LogFile, err)
-	}
-	defer f.Close()
-
+	defer func() {
+		teaProgram.Send(notification{
+			waitForCleanup: true,
+		})
+		e.tearDownTestSuite(context.Background(), tests, teaProgram)
+	}()
 	ctx, cancel := context.WithTimeout(ctx, e.Duration)
 	defer cancel()
 
@@ -156,26 +158,101 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []testspkg.Test, teaP
 		for {
 			select {
 			case <-ctx.Done():
+				teaProgram.Send(notification{
+					waitForCleanup: true,
+				})
+				cancel()
 				return
 			case <-ticker.C:
 				totalCount, successCount := e.Stats.Info()
 				failureCount := totalCount - successCount
 				if failureCount > e.FailAfter {
 					teaProgram.Send(notification{
-						err: errors.New("exceeded fail-after count"),
+						err:            errors.New("exceeded fail-after count"),
+						waitForCleanup: true,
 					})
+					cancel()
 					return
 				}
 			}
 		}
 	}()
 
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			// Start executing tests.
+			e.runTestSuite(ctx, tests, teaProgram)
+		}
+	}
+
+	return nil
+}
+
+func (e *Executor) executeTest(ctx context.Context, test testspkg.Test) (err error) {
+	defer func() {
+		err = test.TearDown(ctx)
+		if err != nil {
+			if utils.IsContextError(err) {
+				err = nil
+				return
+			}
+			err = fmt.Errorf("Error while tearing down '%s' test; %v", test.Name(), err)
+		}
+	}()
+	if err := test.Init(ctx, testspkg.Config{
+		Clients:      e.Clients,
+		Bucket:       e.Bucket,
+		Logger:       e.Logger,
+		ObjectsCount: e.ObjectsCount,
+		Concurrency:  e.Concurrency,
+	}, e.Stats); err != nil {
+		if utils.IsContextError(err) {
+			return nil
+		}
+		return fmt.Errorf("Error while initializing '%s' test; %v", test.Name(), err)
+	}
+	if err := test.Setup(ctx); err != nil {
+		if utils.IsContextError(err) {
+			return nil
+		}
+		return fmt.Errorf("Error while setting up '%s' test; %v", test.Name(), err)
+	}
+	if err := test.Run(ctx); err != nil {
+		if utils.IsContextError(err) {
+			return nil
+		}
+		return fmt.Errorf("Error while running '%s' test; %v", test.Name(), err)
+	}
+	return
+}
+
+func (e *Executor) tearDownTestSuite(ctx context.Context, tests []testspkg.Test, teaProgram *tea.Program) {
 	var wg sync.WaitGroup
 	for i := range tests {
 		wg.Add(1)
 		go func(test testspkg.Test) {
 			defer wg.Done()
-			if err = e.executeTest(ctx, test, f); err != nil {
+			if err := test.TearDown(ctx); err != nil {
+				teaProgram.Send(notification{
+					err: fmt.Errorf("unable to cleanup test %s; %v", test.Name(), err),
+				})
+			}
+		}(tests[i])
+	}
+	wg.Wait()
+	return
+}
+
+func (e *Executor) runTestSuite(ctx context.Context, tests []testspkg.Test, teaProgram *tea.Program) {
+	var wg sync.WaitGroup
+	for i := range tests {
+		wg.Add(1)
+		go func(test testspkg.Test) {
+			defer wg.Done()
+			if err := e.executeTest(ctx, test); err != nil {
 				teaProgram.Send(notification{
 					err: err,
 				})
@@ -183,30 +260,39 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []testspkg.Test, teaP
 		}(tests[i])
 	}
 	wg.Wait()
-
-	return nil
+	return
 }
 
-func (e *Executor) executeTest(ctx context.Context, test testspkg.Test, logFile *os.File) (err error) {
-	defer func() {
-		err = test.TearDown(ctx)
-		if err != nil {
-			err = fmt.Errorf("Error while tearing down '%s' test; %v", test.Name(), err)
+// MonitorNodeHealth repeatedly checks is the nodes are offline or not and prints it to the console screen and the log file.
+func (e *Executor) MonitorNodeHealth(ctx context.Context, teaProgram *tea.Program) {
+	offlineMap := make(map[string]time.Time, len(e.Clients))
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for i := range e.Clients {
+				urlStr := e.Clients[i].EndpointURL().String()
+				offlineT, ok := offlineMap[urlStr]
+				switch {
+				case e.Clients[i].IsOffline() && !ok:
+					offlineMap[urlStr] = time.Now()
+					logMsg := urlStr + " is offline"
+					teaProgram.Send(notification{
+						log: logMsg,
+					})
+					e.Logger.Log("\n" + logMsg + "\n")
+				case e.Clients[i].IsOnline() && ok:
+					logMsg := urlStr + " is back online in " + time.Since(offlineT).String()
+					teaProgram.Send(notification{
+						log: logMsg,
+					})
+					e.Logger.Log("\n" + logMsg + "\n")
+					delete(offlineMap, urlStr)
+				}
+			}
 		}
-	}()
-	if err := test.Init(ctx, testspkg.Config{
-		Clients:     e.Clients,
-		Bucket:      e.Bucket,
-		LogFile:     logFile,
-		Concurrency: e.Concurrency,
-	}, e.Stats); err != nil {
-		return fmt.Errorf("Error while initializing '%s' test; %v", test.Name(), err)
 	}
-	if err := test.Setup(ctx); err != nil {
-		return fmt.Errorf("Error while setting up '%s' test; %v", test.Name(), err)
-	}
-	if err := test.Run(ctx); err != nil {
-		return fmt.Errorf("Error while running '%s' test; %v", test.Name(), err)
-	}
-	return
 }

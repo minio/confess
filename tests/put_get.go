@@ -33,8 +33,6 @@ import (
 	xnet "github.com/minio/pkg/net"
 )
 
-const objectCountForPutGetTest = 50
-
 // PutGetTest uploads the objects using a random client and then
 // Gets the objects from each node to verify if the get output
 // is consistent accross nodes.
@@ -45,6 +43,9 @@ type PutGetTest struct {
 	objectsWithMetaData sync.Map
 	apiStats            *Stats
 	concurrency         int
+	objectsCount        int
+	logger              utils.Logger
+	initialized         bool
 }
 
 // metaData to store the uploaded object's info
@@ -67,57 +68,58 @@ func (t *PutGetTest) Name() string {
 // Init initialized the test.
 func (t *PutGetTest) Init(ctx context.Context, config Config, stats *Stats) error {
 	t.clients = config.Clients
-	t.logFile = config.LogFile
+	t.logger = config.Logger
 	t.bucket = config.Bucket
 	t.objectsWithMetaData = sync.Map{}
 	t.apiStats = stats
 	t.concurrency = config.Concurrency
+	t.objectsCount = config.ObjectsCount
+	t.initialized = true
 	return nil
 }
 
 // Setup prepares the test by uploading the objects to the test bucket.
 func (t *PutGetTest) Setup(ctx context.Context) error {
-	return runFn(ctx,
-		objectCountForPutGetTest,
-		t.concurrency,
-		func(ctx context.Context, index int) error {
-			client, err := utils.GetRandomClient(t.clients)
-			if err != nil {
+	if !t.initialized {
+		return errTestNotInitialized
+	}
+	return runFn(ctx, t.objectsCount, t.concurrency, func(ctx context.Context, index int) error {
+		client, err := utils.GetRandomClient(t.clients)
+		if err != nil {
+			t.logger.V(3).Log(logMessage(t.Name(), nil, err.Error()))
+			return err
+		}
+		object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), index)
+		hasher := sha256.New()
+		tr := io.TeeReader(reader(humanize.MiByte*5), hasher)
+		if objectInfo, err := put(ctx, putConfig{
+			client:     client,
+			bucketName: t.bucket,
+			objectName: object,
+			reader:     tr,
+			opts:       minio.PutObjectOptions{},
+		}, t.apiStats); err != nil {
+			t.logger.V(3).Log(logMessage(t.Name(), client, err.Error()))
+			if !xnet.IsNetworkOrHostDown(err, false) {
 				return err
 			}
-			object := fmt.Sprintf("confess/%s/%s/pfx-%d", t.Name(), time.Now().Format("01_02_06_15:04"), index)
-			hasher := sha256.New()
-			tr := io.TeeReader(reader(humanize.MiByte*5), hasher)
-			if objectInfo, err := put(ctx, putConfig{
-				client:     client,
-				bucketName: t.bucket,
-				objectName: object,
-				reader:     tr,
-				opts:       minio.PutObjectOptions{},
-			}, t.apiStats); err != nil {
-				if err := log(ctx,
-					t.logFile,
-					t.Name(),
-					client.EndpointURL().String(),
-					fmt.Sprintf("unable to put the object %s; %v", object, err),
-				); err != nil {
-					return err
-				}
-			} else {
-				t.objectsWithMetaData.Store(object, metaData{
-					sha256: hasher.Sum(nil),
-					size:   objectInfo.Size,
-					etag:   objectInfo.ETag,
-				})
-			}
-			return nil
-		},
-	)
+		} else {
+			t.objectsWithMetaData.Store(object, metaData{
+				sha256: hasher.Sum(nil),
+				size:   objectInfo.Size,
+				etag:   objectInfo.ETag,
+			})
+		}
+		return nil
+	})
 }
 
 // Run executes the test by verifying if the get output is
 // consistent accross the nodes.
 func (t *PutGetTest) Run(ctx context.Context) error {
+	if !t.initialized {
+		return errTestNotInitialized
+	}
 	var offlineNodes atomic.Int64
 	var errFound atomic.Bool
 	if err := runFn(ctx,
@@ -126,37 +128,32 @@ func (t *PutGetTest) Run(ctx context.Context) error {
 		func(ctx context.Context, index int) error {
 			if t.clients[index].IsOffline() {
 				offlineNodes.Add(1)
-				if err := log(
-					ctx,
-					t.logFile,
-					t.Name(),
-					t.clients[index].EndpointURL().String(),
-					fmt.Sprintf("the node %s is offline", t.clients[index].EndpointURL().String()),
-				); err != nil {
-					return err
-				}
 				return nil
 			}
 			if err := t.verify(ctx, t.clients[index]); err != nil {
-				if !xnet.IsNetworkOrHostDown(err, true) {
-					errFound.CompareAndSwap(false, true)
-				} else {
-					offlineNodes.Add(1)
-				}
-				if err := log(
-					ctx,
-					t.logFile,
-					t.Name(),
-					t.clients[index].EndpointURL().String(),
-					fmt.Sprintf("unable to verify %s test; %v", t.Name(), err),
-				); err != nil {
+				switch {
+				case utils.IsContextError(err):
 					return err
+				case xnet.IsNetworkOrHostDown(err, false):
+					offlineNodes.Add(1)
+				default:
+					errFound.CompareAndSwap(false, true)
+					if err := t.logger.Log(
+						logMessage(
+							t.Name(),
+							t.clients[index],
+							fmt.Sprintf("unable to verify %s test; %v", t.Name(), err),
+						),
+					); err != nil {
+						return err
+					}
 				}
 			}
 			return nil
 		},
 	); err != nil {
-		return nil
+		t.logger.V(3).Log(logMessage(t.Name(), nil, err.Error()))
+		return err
 	}
 	if offlineNodes.Load() == int64(len(t.clients)) {
 		return errors.New("all nodes are offline")
@@ -169,19 +166,32 @@ func (t *PutGetTest) Run(ctx context.Context) error {
 
 // TearDown removes the uploaded objects from the test bucket.
 func (t *PutGetTest) TearDown(ctx context.Context) error {
-	client, err := utils.GetRandomClient(t.clients)
-	if err != nil {
-		return err
+	if !t.initialized {
+		// No clean up required.
+		return nil
 	}
-	return removeObjects(ctx, removeObjectsConfig{
-		client:     client,
-		bucketName: t.bucket,
-		logFile:    t.logFile,
-		listOpts: minio.ListObjectsOptions{
-			Recursive: true,
-			Prefix:    fmt.Sprintf("confess/%s/", t.Name()),
-		},
-	}, t.apiStats)
+	for {
+		client, err := utils.GetRandomClient(t.clients)
+		if err != nil {
+			t.logger.V(4).Log(logMessage(t.Name(), nil, err.Error()))
+			return err
+		}
+		if err := removeObjects(ctx, removeObjectsConfig{
+			client:     client,
+			bucketName: t.bucket,
+			listOpts: minio.ListObjectsOptions{
+				Recursive: true,
+				Prefix:    fmt.Sprintf("confess/%s/", t.Name()),
+			},
+		}, t.apiStats); err != nil {
+			t.logger.V(4).Log(logMessage(t.Name(), client, err.Error()))
+			if xnet.IsNetworkOrHostDown(err, false) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
 }
 
 func (t *PutGetTest) verify(ctx context.Context, client *minio.Client) (err error) {

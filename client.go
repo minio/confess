@@ -59,7 +59,7 @@ func newClient(ctx context.Context, endpoint string, config Config) (*minio.Clie
 		return nil, err
 	}
 	// start healthcheck on the endpoint
-	cancelFn, err := clnt.HealthCheck(2 * time.Second)
+	cancelFn, err := clnt.HealthCheck(1 * time.Second)
 	if err != nil {
 		return nil, err
 

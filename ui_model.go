@@ -16,10 +16,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -27,30 +29,38 @@ import (
 	"github.com/minio/confess/tests"
 )
 
-const padding = 1
+const (
+	padding = 1
+	tick    = "✔"
+)
 
 var baseStyle = lipgloss.NewStyle().
 	BorderStyle(lipgloss.RoundedBorder()).
 	BorderForeground(lipgloss.Color("FCFFE7"))
 
 type progressModel struct {
-	stats     *tests.Stats
-	errLogs   []string
-	done      bool
-	startTime time.Time
-	table     table.Model
+	stats           *tests.Stats
+	errLogs         []string
+	logs            []string
+	done            bool
+	startTime       time.Time
+	table           table.Model
+	spinner         spinner.Model
+	cancelParentCtx context.CancelFunc
+	waitForCleanup  bool
 }
 
-func newProgressModel(stats *tests.Stats) *progressModel {
+func newProgressModel(stats *tests.Stats, parentCtxCancel context.CancelFunc) *progressModel {
 	progressM := &progressModel{}
 	progressM.stats = stats
 	progressM.startTime = time.Now()
+	progressM.cancelParentCtx = parentCtxCancel
 
 	columns := []table.Column{
 		{Title: "Total Operations", Width: 20},
-		{Title: "Succeeded", Width: 10},
-		{Title: "Failed", Width: 10},
-		{Title: "Duration", Width: 10},
+		{Title: "Succeeded", Width: 20},
+		{Title: "Failed", Width: 20},
+		{Title: "Duration", Width: 20},
 	}
 	t := table.New(
 		table.WithColumns(columns),
@@ -70,13 +80,18 @@ func newProgressModel(stats *tests.Stats) *progressModel {
 
 	progressM.table = t
 
+	progressM.spinner = spinner.New()
+	progressM.spinner.Spinner = spinner.Points
+	progressM.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#F7971E"))
+
 	return progressM
 }
 
 type notification struct {
-	log  string
-	done bool
-	err  error
+	waitForCleanup bool
+	log            string
+	done           bool
+	err            error
 }
 
 type TickMsg time.Time
@@ -88,24 +103,27 @@ func tickEvery() tea.Cmd {
 }
 
 func finalPause() tea.Cmd {
-	return tea.Tick(time.Millisecond*750, func(_ time.Time) tea.Msg {
+	return tea.Tick(time.Second*1, func(_ time.Time) tea.Msg {
 		return nil
 	})
 }
 
+func (m progressModel) initSpinner() tea.Cmd {
+	return m.spinner.Tick
+}
+
 func (m progressModel) Init() tea.Cmd {
-	return tickEvery()
+	return tea.Batch([]tea.Cmd{tickEvery(), m.initSpinner()}...)
 }
 
 func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return m, nil
-
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
+		if msg.String() == "ctrl+c" {
+			m.waitForCleanup = true
+			m.cancelParentCtx()
 		}
 		return m, nil
 	case TickMsg:
@@ -120,13 +138,21 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errLogs = append(m.errLogs, msg.err.Error())
 		}
+		if msg.log != "" {
+			m.logs = append(m.logs, msg.log)
+		}
+		if msg.waitForCleanup {
+			m.waitForCleanup = true
+		}
 		if msg.done {
 			m.done = msg.done
 			return m, tea.Sequence(finalPause(), tea.Quit)
 		}
 		return m, cmd
 	default:
-		return m, nil
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 }
 
@@ -149,6 +175,21 @@ func (m progressModel) View() (str string) {
 		str += pad + fmt.Sprintln(color.HiRedString("%s", m.errLogs[i]))
 		if i == len(m.errLogs)-1 {
 			str += "\n"
+		}
+	}
+
+	for i := range m.logs {
+		str += pad + fmt.Sprintln(color.HiYellowString("%s", m.logs[i]))
+		if i == len(m.logs)-1 {
+			str += "\n"
+		}
+	}
+
+	if m.waitForCleanup {
+		if m.done {
+			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaned up test suite"), m.spinner.Style.Render(tick))
+		} else {
+			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaning up test suite. Please wait"), m.spinner.View())
 		}
 	}
 

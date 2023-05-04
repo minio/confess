@@ -17,9 +17,12 @@ package tests
 
 import (
 	"context"
+	"errors"
 
 	"github.com/minio/pkg/sync/errgroup"
 )
+
+var errTestNotInitialized = errors.New("the test is not initialized")
 
 // Test interface defines the test.
 type Test interface {

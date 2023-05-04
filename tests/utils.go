@@ -16,15 +16,15 @@
 package tests
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"os"
 	"time"
 
+	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
+	xnet "github.com/minio/pkg/net"
 )
 
 func init() {
@@ -33,10 +33,11 @@ func init() {
 
 // Config represents the test config
 type Config struct {
-	Clients     []*minio.Client
-	Bucket      string
-	LogFile     *os.File
-	Concurrency int
+	Clients      []*minio.Client
+	Bucket       string
+	Logger       utils.Logger
+	ObjectsCount int
+	Concurrency  int
 }
 
 func newRandomReader(seed, size int64) io.Reader {
@@ -48,7 +49,22 @@ func reader(size int64) io.ReadCloser {
 	return ioutil.NopCloser(newRandomReader(size, size))
 }
 
-func log(ctx context.Context, f *os.File, testName, clientURL, msg string) error {
-	_, err := f.WriteString(fmt.Sprintf("[%s][%s] %s", testName, clientURL, msg) + "\n")
-	return err
+func logMessage(testName string, client *minio.Client, msg string) string {
+	message := fmt.Sprintf("[%v]", time.Now().Format("2006-01-02T15:04:05"))
+
+	if testName != "" {
+		message += "[" + testName + "]"
+	}
+	if client != nil && client.EndpointURL() != nil {
+		message += "[" + client.EndpointURL().String() + "]"
+	}
+	if msg != "" {
+		message += " " + msg
+	}
+
+	return "\n" + message + "\n"
+}
+
+func isIgnored(err error) bool {
+	return utils.IsContextError(err) || xnet.IsNetworkOrHostDown(err, false)
 }
