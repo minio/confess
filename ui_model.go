@@ -23,6 +23,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fatih/color"
@@ -30,8 +31,9 @@ import (
 )
 
 const (
-	padding = 1
-	tick    = "✔"
+	padding                    = 1
+	tick                       = "✔"
+	useHighPerformanceRenderer = true
 )
 
 var baseStyle = lipgloss.NewStyle().
@@ -48,6 +50,9 @@ type progressModel struct {
 	spinner         spinner.Model
 	cancelParentCtx context.CancelFunc
 	waitForCleanup  bool
+	ready           bool
+	viewport        viewport.Model
+	maxHeight       int
 }
 
 func newProgressModel(stats *tests.Stats, parentCtxCancel context.CancelFunc) *progressModel {
@@ -119,7 +124,22 @@ func (m progressModel) Init() tea.Cmd {
 func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		return m, nil
+		var cmd tea.Cmd
+		var cmds []tea.Cmd
+		if !m.ready {
+			m.viewport = viewport.New(msg.Width, lipgloss.Height(m.getContent()))
+			m.viewport.HighPerformanceRendering = useHighPerformanceRenderer
+			m.ready = true
+		} else {
+			m.viewport.Width = msg.Width
+		}
+		m.maxHeight = msg.Height - lipgloss.Height(m.tableView())
+		if useHighPerformanceRenderer {
+			cmds = append(cmds, viewport.Sync(m.viewport))
+		}
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+		return m, tea.Batch(cmds...)
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			m.waitForCleanup = true
@@ -133,11 +153,13 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd, tickEvery())
 		return m, tea.Batch(cmds...)
 	case notification:
-		var cmd tea.Cmd
+		var cmd, vCmd tea.Cmd
+		var cmds []tea.Cmd
 		m.table, cmd = m.table.Update(msg)
 		if msg.err != nil {
 			m.errLogs = append(m.errLogs, msg.err.Error())
 		}
+		cmds = append(cmds, cmd)
 		if msg.log != "" {
 			m.logs = append(m.logs, msg.log)
 		}
@@ -148,15 +170,44 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.done = msg.done
 			return m, tea.Sequence(finalPause(), tea.Quit)
 		}
-		return m, cmd
+		if m.ready {
+			if contentHeight := lipgloss.Height(m.getContent()); contentHeight < m.maxHeight {
+				m.viewport.Height = contentHeight
+			}
+			m.viewport.SetContent(m.getContent())
+			m.viewport, vCmd = m.viewport.Update(msg)
+			cmds = append(cmds, []tea.Cmd{vCmd, viewport.Sync(m.viewport)}...)
+		}
+		return m, tea.Batch(cmds...)
 	default:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
+		var sCmd, vCmd tea.Cmd
+		var cmds []tea.Cmd
+		m.viewport, vCmd = m.viewport.Update(msg)
+		m.spinner, sCmd = m.spinner.Update(msg)
+		cmds = append(cmds, []tea.Cmd{sCmd, vCmd}...)
+		return m, tea.Batch(cmds...)
 	}
 }
 
-func (m progressModel) View() (str string) {
+func (m progressModel) padding() string {
+	return strings.Repeat(" ", padding)
+}
+
+func (m progressModel) getContent() (str string) {
+	pad := m.padding()
+	for i := range m.errLogs {
+		str += "\n" + pad + fmt.Sprintf(color.HiRedString("%s", m.errLogs[i]))
+		if i == len(m.errLogs)-1 {
+			str += "\n"
+		}
+	}
+	for i := range m.logs {
+		str += "\n" + pad + fmt.Sprintf(color.HiYellowString("%s", m.logs[i]))
+	}
+	return
+}
+
+func (m progressModel) tableView() (str string) {
 	totalCount, successCount := m.stats.Info()
 	duration := time.Since(m.startTime)
 	rows := []table.Row{
@@ -168,30 +219,20 @@ func (m progressModel) View() (str string) {
 		},
 	}
 	m.table.SetRows(rows)
-	pad := strings.Repeat(" ", padding)
-	str += pad + "\n" + baseStyle.Render(m.table.View()) + "\n\n"
+	return m.padding() + "\n\n" + baseStyle.Render(m.table.View()) + "\n\n"
+}
 
-	for i := range m.errLogs {
-		str += pad + fmt.Sprintln(color.HiRedString("%s", m.errLogs[i]))
-		if i == len(m.errLogs)-1 {
-			str += "\n"
-		}
+func (m progressModel) View() string {
+	if !m.ready {
+		return ""
 	}
-
-	for i := range m.logs {
-		str += pad + fmt.Sprintln(color.HiYellowString("%s", m.logs[i]))
-		if i == len(m.logs)-1 {
-			str += "\n"
-		}
-	}
-
+	str := m.tableView()
 	if m.waitForCleanup {
 		if m.done {
-			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaned up test suite"), m.spinner.Style.Render(tick))
+			str += m.padding() + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaned up test suite"), m.spinner.Style.Render(tick))
 		} else {
-			str += pad + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaning up test suite. Please wait"), m.spinner.View())
+			str += m.padding() + fmt.Sprintf("%s %s\n", color.HiYellowString("Cleaning up test suite. Please wait"), m.spinner.View())
 		}
 	}
-
-	return str + pad
+	return m.viewport.View() + str
 }

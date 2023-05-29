@@ -23,6 +23,7 @@ import (
 type Logger interface {
 	Log(message string) error
 	V(level int) Logger
+	CurrentV() int
 }
 
 // FileLogger logs the messages to a file.
@@ -35,6 +36,11 @@ type FileLogger struct {
 func (l *FileLogger) Log(message string) error {
 	_, err := l.file.WriteString(message)
 	return err
+}
+
+// CurrentV returns the current verbosity level configured.
+func (l *FileLogger) CurrentV() int {
+	return l.verbosity
 }
 
 // New returns the FileLogger instance.
@@ -60,6 +66,11 @@ type NoOpLogger struct{}
 // Log does a No-Op.
 func (l NoOpLogger) Log(message string) error {
 	return nil
+}
+
+// CurrentV for NoOP returns -1 (For interface compatibility).
+func (l NoOpLogger) CurrentV() int {
+	return -1
 }
 
 // V returns the FileLogger if the verbosity level is less than

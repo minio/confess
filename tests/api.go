@@ -146,9 +146,10 @@ func get(ctx context.Context, config getConfig, stats *Stats) (object *minio.Obj
 }
 
 type removeObjectsConfig struct {
-	client     *minio.Client
-	bucketName string
-	listOpts   minio.ListObjectsOptions
+	client      *minio.Client
+	bucketName  string
+	listOpts    minio.ListObjectsOptions
+	skipErrStat bool
 }
 
 func removeObjects(ctx context.Context, config removeObjectsConfig, stats *Stats) (err error) {
@@ -162,10 +163,11 @@ func removeObjects(ctx context.Context, config removeObjectsConfig, stats *Stats
 	}
 	for _, object := range objects {
 		if err := removeObject(ctx, removeObjectConfig{
-			client:     config.client,
-			bucketName: config.bucketName,
-			objectKey:  object.Key,
-			removeOpts: minio.RemoveObjectOptions{},
+			client:      config.client,
+			bucketName:  config.bucketName,
+			objectKey:   object.Key,
+			removeOpts:  minio.RemoveObjectOptions{},
+			skipErrStat: config.skipErrStat,
 		}, stats); err != nil {
 			return nil
 		}
@@ -174,15 +176,19 @@ func removeObjects(ctx context.Context, config removeObjectsConfig, stats *Stats
 }
 
 type removeObjectConfig struct {
-	client     *minio.Client
-	bucketName string
-	objectKey  string
-	removeOpts minio.RemoveObjectOptions
+	client      *minio.Client
+	bucketName  string
+	objectKey   string
+	removeOpts  minio.RemoveObjectOptions
+	skipErrStat bool
 }
 
 func removeObject(ctx context.Context, config removeObjectConfig, stats *Stats) (err error) {
 	defer func() {
-		if !isIgnored(err) {
+		switch {
+		case err != nil && config.skipErrStat:
+		case err != nil && isIgnored(err):
+		default:
 			stats.increment(err == nil)
 		}
 	}()

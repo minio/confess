@@ -24,6 +24,8 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
+var ErrAllTargetsOffline = errors.New("all the targets are offline")
+
 const maxAttempts = 3
 
 // GetRandomClient fetches a random client from the provided list of clients.
@@ -39,7 +41,7 @@ func getRandomClient(clients []*minio.Client, attempt int) (*minio.Client, error
 	for clients[idx].IsOffline() {
 		if len(visitedIds) == len(clients) {
 			if attempt == maxAttempts {
-				return nil, errors.New("all the targets are offline")
+				return nil, ErrAllTargetsOffline
 			}
 			attempt++
 			time.Sleep(2 * time.Second)

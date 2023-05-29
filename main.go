@@ -240,7 +240,7 @@ func confessMain(c *cli.Context) {
 
 	var wg sync.WaitGroup
 	m := newProgressModel(executor.Stats, cancel)
-	teaProgram := tea.NewProgram(m)
+	teaProgram := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

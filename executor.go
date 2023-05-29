@@ -195,7 +195,7 @@ func (e *Executor) executeTest(ctx context.Context, test testspkg.Test) (err err
 	defer func() {
 		err = test.TearDown(ctx)
 		if err != nil {
-			if utils.IsContextError(err) {
+			if utils.IsContextError(err) || errors.Is(err, utils.ErrAllTargetsOffline) {
 				err = nil
 				return
 			}
@@ -235,7 +235,7 @@ func (e *Executor) tearDownTestSuite(ctx context.Context, tests []testspkg.Test,
 		wg.Add(1)
 		go func(test testspkg.Test) {
 			defer wg.Done()
-			if err := test.TearDown(ctx); err != nil {
+			if err := test.TearDown(ctx); err != nil && !errors.Is(err, utils.ErrAllTargetsOffline) {
 				teaProgram.Send(notification{
 					err: fmt.Errorf("unable to cleanup test %s; %v", test.Name(), err),
 				})

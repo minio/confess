@@ -99,7 +99,9 @@ func (t *PutGetTest) Setup(ctx context.Context) error {
 			reader:     tr,
 			opts:       minio.PutObjectOptions{},
 		}, t.apiStats); err != nil {
-			t.logger.V(3).Log(logMessage(t.Name(), client, err.Error()))
+			if !utils.IsContextError(err) {
+				t.logger.V(3).Log(logMessage(t.Name(), client, err.Error()))
+			}
 			if !xnet.IsNetworkOrHostDown(err, false) {
 				return err
 			}
@@ -183,6 +185,7 @@ func (t *PutGetTest) TearDown(ctx context.Context) error {
 				Recursive: true,
 				Prefix:    fmt.Sprintf("confess/%s/", t.Name()),
 			},
+			skipErrStat: t.logger.CurrentV() < 4,
 		}, t.apiStats); err != nil {
 			t.logger.V(4).Log(logMessage(t.Name(), client, err.Error()))
 			if xnet.IsNetworkOrHostDown(err, false) {
