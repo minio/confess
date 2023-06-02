@@ -18,9 +18,7 @@ package tests
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"sync/atomic"
 
 	"github.com/minio/minio-go/v7"
 )
@@ -28,29 +26,6 @@ import (
 var (
 	errNilClient = errors.New("client is nil")
 )
-
-// Stats denotes the statistical information on the API requests made.
-type Stats struct {
-	TotalCount   atomic.Int64
-	SuccessCount atomic.Int64
-}
-
-func (stats *Stats) String() string {
-	total, success := stats.Info()
-	return fmt.Sprintf("Total: %d\nSuccess: %d\nFailed: %d", total, success, total-success)
-}
-
-func (stats *Stats) increment(success bool) {
-	stats.TotalCount.Add(1)
-	if success {
-		stats.SuccessCount.Add(1)
-	}
-}
-
-// Info returns the stat info.
-func (stats *Stats) Info() (total, success int64) {
-	return stats.TotalCount.Load(), stats.SuccessCount.Load()
-}
 
 type putConfig struct {
 	client     *minio.Client
@@ -64,7 +39,7 @@ type putConfig struct {
 func put(ctx context.Context, config putConfig, stats *Stats) (info minio.UploadInfo, err error) {
 	defer func() {
 		if !isIgnored(err) {
-			stats.increment(err == nil)
+			stats.updateAPIStat(err == nil)
 		}
 	}()
 	if config.client == nil {
@@ -88,7 +63,7 @@ type listConfig struct {
 func list(ctx context.Context, config listConfig, stats *Stats) (objInfo []minio.ObjectInfo, err error) {
 	defer func() {
 		if !isIgnored(err) {
-			stats.increment(err == nil)
+			stats.updateAPIStat(err == nil)
 		}
 	}()
 	if config.client == nil {
@@ -115,7 +90,7 @@ type statConfig struct {
 func stat(ctx context.Context, config statConfig, stats *Stats) (info minio.ObjectInfo, err error) {
 	defer func() {
 		if !isIgnored(err) {
-			stats.increment(err == nil)
+			stats.updateAPIStat(err == nil)
 		}
 	}()
 	if config.client == nil {
@@ -135,7 +110,7 @@ type getConfig struct {
 func get(ctx context.Context, config getConfig, stats *Stats) (object *minio.Object, err error) {
 	defer func() {
 		if !isIgnored(err) {
-			stats.increment(err == nil)
+			stats.updateAPIStat(err == nil)
 		}
 	}()
 	if config.client == nil {
@@ -189,7 +164,7 @@ func removeObject(ctx context.Context, config removeObjectConfig, stats *Stats) 
 		case err != nil && config.skipErrStat:
 		case err != nil && isIgnored(err):
 		default:
-			stats.increment(err == nil)
+			stats.updateAPIStat(err == nil)
 		}
 	}()
 	return config.client.RemoveObject(ctx, config.bucketName, config.objectKey, config.removeOpts)

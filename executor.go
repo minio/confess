@@ -136,7 +136,7 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 		Concurrency:          config.Concurrency,
 		ObjectsCount:         config.ObjectsCount,
 		Logger:               config.Logger,
-		Stats:                &testspkg.Stats{},
+		Stats:                testspkg.NewStats(),
 	}, nil
 }
 
@@ -164,9 +164,9 @@ func (e *Executor) ExecuteTests(ctx context.Context, tests []testspkg.Test, teaP
 				cancel()
 				return
 			case <-ticker.C:
-				totalCount, successCount := e.Stats.Info()
-				failureCount := totalCount - successCount
-				if failureCount > e.FailAfter {
+				_, failedAPIs := e.Stats.APIInfo()
+				_, failedTests := e.Stats.TestInfo()
+				if failedAPIs+failedTests > e.FailAfter {
 					teaProgram.Send(notification{
 						err:            errors.New("exceeded fail-after count"),
 						waitForCleanup: true,

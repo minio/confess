@@ -37,7 +37,7 @@ type PutStatTest struct {
 	logger              utils.Logger
 	bucket              string
 	uploadedObjectNames sync.Map
-	apiStats            *Stats
+	stats               *Stats
 	concurrency         int
 	objectsCount        int
 	initialized         bool
@@ -58,7 +58,7 @@ func (t *PutStatTest) Init(ctx context.Context, config Config, stats *Stats) err
 	t.logger = config.Logger
 	t.bucket = config.Bucket
 	t.uploadedObjectNames = sync.Map{}
-	t.apiStats = stats
+	t.stats = stats
 	t.concurrency = config.Concurrency
 	t.objectsCount = config.ObjectsCount
 	t.initialized = true
@@ -83,7 +83,7 @@ func (t *PutStatTest) Setup(ctx context.Context) error {
 			objectName: object,
 			size:       humanize.MiByte * 5,
 			opts:       minio.PutObjectOptions{},
-		}, t.apiStats); err != nil {
+		}, t.stats); err != nil {
 			if !utils.IsContextError(err) {
 				t.logger.V(3).Log(logMessage(t.Name(), client, err.Error()))
 			}
@@ -110,6 +110,7 @@ func (t *PutStatTest) Run(ctx context.Context) error {
 			offlineNodes.Add(1)
 			return nil
 		}
+		t.stats.incrementTotalTests()
 		if err := t.verify(ctx, t.clients[index]); err != nil {
 			switch {
 			case utils.IsContextError(err):
@@ -117,6 +118,7 @@ func (t *PutStatTest) Run(ctx context.Context) error {
 			case xnet.IsNetworkOrHostDown(err, false):
 				offlineNodes.Add(1)
 			default:
+				t.stats.incrementFailedTests()
 				errFound.CompareAndSwap(false, true)
 				if err := t.logger.Log(
 					logMessage(
@@ -163,7 +165,7 @@ func (t *PutStatTest) TearDown(ctx context.Context) error {
 				Prefix:    fmt.Sprintf("confess/%s/", t.Name()),
 			},
 			skipErrStat: t.logger.CurrentV() < 4,
-		}, t.apiStats); err != nil {
+		}, t.stats); err != nil {
 			t.logger.V(4).Log(logMessage(t.Name(), client, err.Error()))
 			if xnet.IsNetworkOrHostDown(err, false) {
 				continue
@@ -182,7 +184,7 @@ func (t *PutStatTest) verify(ctx context.Context, client *minio.Client) (err err
 			bucketName: t.bucket,
 			objectName: objectName,
 			opts:       minio.StatObjectOptions{},
-		}, t.apiStats)
+		}, t.stats)
 		return err == nil
 	})
 	return

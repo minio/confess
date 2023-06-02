@@ -208,13 +208,16 @@ func (m progressModel) getContent() (str string) {
 }
 
 func (m progressModel) tableView() (str string) {
-	totalCount, successCount := m.stats.Info()
+	totalAPIs, failedAPIs := m.stats.APIInfo()
+	totalTests, failedTests := m.stats.TestInfo()
+	totalCount := totalAPIs + totalTests
+	failedCount := failedAPIs + failedTests
 	duration := time.Since(m.startTime)
 	rows := []table.Row{
 		{
 			color.HiWhiteString("%d", totalCount),
-			color.HiWhiteString("%d", successCount),
-			color.HiRedString("%d", totalCount-successCount),
+			color.HiWhiteString("%d", totalCount-failedCount),
+			color.HiRedString("%d", failedCount),
 			color.HiWhiteString(duration.Round(time.Second).String()),
 		},
 	}

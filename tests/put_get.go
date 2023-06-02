@@ -41,7 +41,7 @@ type PutGetTest struct {
 	logFile             *os.File
 	bucket              string
 	objectsWithMetaData sync.Map
-	apiStats            *Stats
+	stats               *Stats
 	concurrency         int
 	objectsCount        int
 	logger              utils.Logger
@@ -71,7 +71,7 @@ func (t *PutGetTest) Init(ctx context.Context, config Config, stats *Stats) erro
 	t.logger = config.Logger
 	t.bucket = config.Bucket
 	t.objectsWithMetaData = sync.Map{}
-	t.apiStats = stats
+	t.stats = stats
 	t.concurrency = config.Concurrency
 	t.objectsCount = config.ObjectsCount
 	t.initialized = true
@@ -98,7 +98,7 @@ func (t *PutGetTest) Setup(ctx context.Context) error {
 			objectName: object,
 			reader:     tr,
 			opts:       minio.PutObjectOptions{},
-		}, t.apiStats); err != nil {
+		}, t.stats); err != nil {
 			if !utils.IsContextError(err) {
 				t.logger.V(3).Log(logMessage(t.Name(), client, err.Error()))
 			}
@@ -132,6 +132,7 @@ func (t *PutGetTest) Run(ctx context.Context) error {
 				offlineNodes.Add(1)
 				return nil
 			}
+			t.stats.incrementTotalTests()
 			if err := t.verify(ctx, t.clients[index]); err != nil {
 				switch {
 				case utils.IsContextError(err):
@@ -140,6 +141,7 @@ func (t *PutGetTest) Run(ctx context.Context) error {
 					offlineNodes.Add(1)
 				default:
 					errFound.CompareAndSwap(false, true)
+					t.stats.incrementFailedTests()
 					if err := t.logger.Log(
 						logMessage(
 							t.Name(),
@@ -186,7 +188,7 @@ func (t *PutGetTest) TearDown(ctx context.Context) error {
 				Prefix:    fmt.Sprintf("confess/%s/", t.Name()),
 			},
 			skipErrStat: t.logger.CurrentV() < 4,
-		}, t.apiStats); err != nil {
+		}, t.stats); err != nil {
 			t.logger.V(4).Log(logMessage(t.Name(), client, err.Error()))
 			if xnet.IsNetworkOrHostDown(err, false) {
 				continue
@@ -207,7 +209,7 @@ func (t *PutGetTest) verify(ctx context.Context, client *minio.Client) (err erro
 			bucketName: t.bucket,
 			objectName: objectName,
 			opts:       minio.GetObjectOptions{},
-		}, t.apiStats)
+		}, t.stats)
 		if err != nil {
 			return false
 		}
