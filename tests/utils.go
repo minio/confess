@@ -13,19 +13,58 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package data
+package tests
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"time"
+
+	"github.com/minio/confess/utils"
+	"github.com/minio/minio-go/v7"
+	xnet "github.com/minio/pkg/net"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+// Config represents the test config
+type Config struct {
+	Clients      []*minio.Client
+	Bucket       string
+	Logger       utils.Logger
+	ObjectsCount int
+	Concurrency  int
+}
 
 func newRandomReader(seed, size int64) io.Reader {
 	return io.LimitReader(rand.New(rand.NewSource(seed)), size)
 }
 
 // read data from file if it exists or optionally create a buffer of particular size
-func Reader(size int64) io.ReadCloser {
+func reader(size int64) io.ReadCloser {
 	return ioutil.NopCloser(newRandomReader(size, size))
+}
+
+func logMessage(testName string, client *minio.Client, msg string) string {
+	message := fmt.Sprintf("[%v]", time.Now().Format("2006-01-02T15:04:05"))
+
+	if testName != "" {
+		message += "[" + testName + "]"
+	}
+	if client != nil && client.EndpointURL() != nil {
+		message += "[" + client.EndpointURL().String() + "]"
+	}
+	if msg != "" {
+		message += " " + msg
+	}
+
+	return "\n" + message + "\n"
+}
+
+func isIgnored(err error) bool {
+	return utils.IsContextError(err) || xnet.IsNetworkOrHostDown(err, false)
 }

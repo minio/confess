@@ -13,41 +13,25 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package tests
+package main
 
 import (
-	"math/rand"
-	"sync"
+	"os"
+
+	"github.com/jedib0t/go-pretty/v6/table"
 )
 
-type Registry struct {
-	sync.RWMutex
-	Tests []Tester
-	tIdx  map[string]int
-}
-
-func NewRegistry() *Registry {
-	return &Registry{
-		Tests: make([]Tester, 0, 10),
-		tIdx:  make(map[string]int),
+func newTableWriter(header table.Row, sortBy []table.SortBy, noHeader bool) table.Writer {
+	writer := table.NewWriter()
+	writer.SetOutputMirror(os.Stdout)
+	writer.AppendHeader(header)
+	writer.SortBy(sortBy)
+	if noHeader {
+		writer.ResetHeaders()
 	}
-}
 
-func (r *Registry) Register(name string, t Tester) {
-	r.Lock()
-	defer r.Unlock()
-	r.Tests = append(r.Tests, t)
-	r.tIdx[name] = len(r.Tests) - 1
-}
+	style := table.StyleLight
+	writer.SetStyle(style)
 
-func (r *Registry) GetRandomTest() Tester {
-	idx := rand.Intn(len(r.Tests))
-	return r.Tests[idx]
-}
-
-func (r *Registry) GetTestByName(name string) Tester {
-	r.RLock()
-	defer r.RUnlock()
-	idx := r.tIdx[name]
-	return r.Tests[idx]
+	return writer
 }
