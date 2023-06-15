@@ -19,11 +19,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
+	"log"
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,7 +33,7 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/confess/tests"
 	"github.com/minio/confess/utils"
-	"github.com/minio/pkg/console"
+	"github.com/minio/mc/pkg/probe"
 )
 
 var (
@@ -45,15 +44,10 @@ const (
 	envPrefix = "CONFESS_"
 )
 
-var buildInfo = map[string]string{}
-
 func init() {
-	rand.Seed(time.Now().UnixNano())
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		for _, skv := range bi.Settings {
-			buildInfo[skv.Key] = skv.Value
-		}
-	}
+	probe.Init() // Set project's root source path.
+	probe.SetAppInfo("Release-Tag", ReleaseTag)
+	probe.SetAppInfo("Commit", ShortCommitID)
 }
 
 func main() {
@@ -62,11 +56,12 @@ func main() {
 	}
 
 	app := cli.NewApp()
-	app.Name = os.Args[0]
+	app.Name = "confess"
 	app.Author = "MinIO, Inc."
 	app.Description = `Object store consistency checker`
 	app.UsageText = "[FLAGS] HOSTS"
 	app.Copyright = "(c) 2023 MinIO, Inc."
+	app.Version = Version + " - " + ShortCommitID
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "access-key",
@@ -152,11 +147,7 @@ EXAMPLES:
 
 func versionBanner(c *cli.Context) io.Reader {
 	banner := &strings.Builder{}
-
-	version := strings.ReplaceAll(buildInfo["vcs.time"], ":", "-")
-	revision := buildInfo["vcs.revision"]
-
-	fmt.Fprintln(banner, color.HiWhiteString("%s version %s (commit-id=%s)", c.App.Name, version, revision))
+	fmt.Fprintln(banner, color.HiWhiteString("%s version %s (commit-id=%s)", c.App.Name, Version, CommitID))
 	fmt.Fprintln(banner, color.BlueString("Runtime:")+color.HiWhiteString(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
 	fmt.Fprintln(banner, color.BlueString("License:")+color.HiWhiteString(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
 	fmt.Fprintln(banner, color.BlueString("Copyright:")+color.HiWhiteString(" 2022 MinIO, Inc."))
@@ -169,10 +160,10 @@ func checkMain(ctx *cli.Context) {
 		os.Exit(1)
 	}
 	if ctx.String("bucket") == "" {
-		console.Fatalln("--bucket flag needs to be set")
+		log.Fatalln("--bucket flag needs to be set")
 	}
 	if !ctx.IsSet("access-key") || !ctx.IsSet("secret-key") {
-		console.Fatalln("--access-key and --secret-key flags needs to be set")
+		log.Fatalln("--access-key and --secret-key flags needs to be set")
 	}
 }
 
@@ -195,7 +186,7 @@ func confessMain(c *cli.Context) {
 
 	outputFile, err := os.OpenFile(outputFileName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		console.Fatalln("unable to open output file", err)
+		log.Fatalln("unable to open output file", err)
 	}
 	defer outputFile.Close()
 
@@ -207,7 +198,7 @@ func confessMain(c *cli.Context) {
 			duration.String(),
 		),
 	); err != nil {
-		console.Fatalln("unable to write to output file", err)
+		log.Fatalln("unable to write to output file", err)
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -216,7 +207,7 @@ func confessMain(c *cli.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		s := <-sigs
-		console.Printf(color.RedString("\nExiting on signal %v; %#v\n\n", s.String(), s))
+		log.Printf(color.RedString("\nExiting on signal %v; %#v\n\n", s.String(), s))
 		cancel()
 	}()
 
@@ -235,7 +226,7 @@ func confessMain(c *cli.Context) {
 		Logger:       utils.NewLogger(outputFile, verbosity),
 	})
 	if err != nil {
-		console.Fatalln(err)
+		log.Fatalln(err)
 	}
 
 	var wg sync.WaitGroup
@@ -272,7 +263,7 @@ func confessMain(c *cli.Context) {
 	if _, err := outputFile.WriteString(
 		fmt.Sprintf("\n****Summary****\n%s\n**************", executor.Stats.String()),
 	); err != nil {
-		console.Fatalln("unable to write to output file", err)
+		log.Fatalln("unable to write to output file", err)
 	}
 
 	return

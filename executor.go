@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,6 @@ import (
 	testspkg "github.com/minio/confess/tests"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/console"
 	"github.com/minio/pkg/ellipses"
 )
 
@@ -95,7 +95,7 @@ func NewExecutor(ctx context.Context, config Config) (*Executor, error) {
 			}
 			patterns, perr := ellipses.FindEllipsesPatterns(host)
 			if perr != nil {
-				console.Fatalln(fmt.Errorf("unable to parse input arg %s: %s", patterns, perr))
+				log.Fatalln(fmt.Errorf("unable to parse input arg %s: %s", patterns, perr))
 			}
 			for _, values := range patterns.Expand() {
 				endpoints = append(endpoints, values...)
