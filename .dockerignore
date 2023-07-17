@@ -1,0 +1,8 @@
+.git
+.github
+docs
+*.gz
+*.tar.gz
+*.bzip2
+*.zip
+dist/

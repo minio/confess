@@ -26,7 +26,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/console/pkg"
 	md5simd "github.com/minio/md5-simd"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -68,7 +67,7 @@ func newClient(ctx context.Context, endpoint string, config Config) (*minio.Clie
 		<-ctx.Done()
 		cancelFn()
 	}()
-	clnt.SetAppInfo("confess", pkg.Version)
+	clnt.SetAppInfo("confess", Version)
 	return clnt, nil
 }
 
