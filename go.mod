@@ -14,7 +14,7 @@ require (
 	github.com/minio/md5-simd v1.1.2
 	github.com/minio/minio-go/v7 v7.0.55-0.20230525060734-b7836f021bfb
 	github.com/minio/pkg v1.7.1
-	golang.org/x/net v0.10.0
+	golang.org/x/net v0.17.0
 )
 
 require (
@@ -53,10 +53,10 @@ require (
 	github.com/tklauser/go-sysconf v0.3.11 // indirect
 	github.com/tklauser/numcpus v0.6.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.2 // indirect
-	golang.org/x/crypto v0.9.0 // indirect
+	golang.org/x/crypto v0.14.0 // indirect
 	golang.org/x/sync v0.1.0 // indirect
-	golang.org/x/sys v0.8.0 // indirect
-	golang.org/x/term v0.8.0 // indirect
-	golang.org/x/text v0.9.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/term v0.13.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
