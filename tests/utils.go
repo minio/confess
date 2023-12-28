@@ -24,7 +24,7 @@ import (
 
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v2/net"
 )
 
 func init() {

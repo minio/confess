@@ -19,7 +19,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/sync/errgroup"
 )
 
 var errTestNotInitialized = errors.New("the test is not initialized")

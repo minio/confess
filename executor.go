@@ -28,7 +28,7 @@ import (
 	testspkg "github.com/minio/confess/tests"
 	"github.com/minio/confess/utils"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/ellipses"
+	"github.com/minio/pkg/v2/ellipses"
 )
 
 var slashSeparator = "/"
